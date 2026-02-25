@@ -1,40 +1,42 @@
--- SIM Card Stock Management table
-CREATE TABLE IF NOT EXISTS simcards (
-  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-  iccid TEXT NOT NULL UNIQUE,
+-- ============================================
+-- Create simcards table
+-- ============================================
+
+-- Drop trigger if exists first (for re-runs)
+DROP TRIGGER IF EXISTS update_simcards_updated_at ON simcards;
+
+-- Drop table if exists (for fresh setup)
+DROP TABLE IF EXISTS simcards CASCADE;
+
+-- Create simcards table
+CREATE TABLE simcards (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  iccid TEXT UNIQUE NOT NULL,
+  imsi TEXT,
   phone_number TEXT,
-  carrier TEXT,
-  status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'assigned', 'activated', 'deactivated')),
-  notes TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
-  updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+  status TEXT NOT NULL DEFAULT 'IN_STORE',
+  mvno_id UUID,
+  distributor_id UUID,
+  box_id UUID,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Enable RLS (Row Level Security)
-ALTER TABLE simcards ENABLE ROW LEVEL SECURITY;
-
--- Allow all operations for authenticated users (adjust policies as needed for your auth)
-CREATE POLICY "Allow all for authenticated" ON simcards
-  FOR ALL
-  USING (true)
-  WITH CHECK (true);
-
--- For public anon key (development), allow all - restrict in production
-CREATE POLICY "Allow all for anon" ON simcards
-  FOR ALL
-  USING (true)
-  WITH CHECK (true);
-
--- Auto-update updated_at
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-  NEW.updated_at = NOW();
-  RETURN NEW;
-END;
-$$ language 'plpgsql';
-
+-- Add updated_at trigger
 CREATE TRIGGER update_simcards_updated_at
   BEFORE UPDATE ON simcards
   FOR EACH ROW
-  EXECUTE PROCEDURE update_updated_at_column();
+  EXECUTE FUNCTION update_updated_at_column();
+
+-- Enable RLS
+ALTER TABLE simcards ENABLE ROW LEVEL SECURITY;
+
+-- Drop policy if exists (for re-runs)
+DROP POLICY IF EXISTS "allow_all_simcards" ON simcards;
+
+-- Create policy
+CREATE POLICY "allow_all_simcards" ON simcards
+  FOR ALL
+  TO anon
+  USING (true)
+  WITH CHECK (true);

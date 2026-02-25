@@ -231,11 +231,20 @@ ALTER TABLE distributors ENABLE ROW LEVEL SECURITY;
 ALTER TABLE stock_distributions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE distribution_details ENABLE ROW LEVEL SECURITY;
 
+-- For public anon key (development), allow all - restrict in production
+DROP POLICY IF EXISTS "Allow all for anon" ON mvnos;
 CREATE POLICY "Allow all for anon" ON mvnos FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all for anon" ON cartons;
 CREATE POLICY "Allow all for anon" ON cartons FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all for anon" ON boxes;
 CREATE POLICY "Allow all for anon" ON boxes FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all for anon" ON physical_sims;
 CREATE POLICY "Allow all for anon" ON physical_sims FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all for anon" ON esim_stock;
 CREATE POLICY "Allow all for anon" ON esim_stock FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all for anon" ON distributors;
 CREATE POLICY "Allow all for anon" ON distributors FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all for anon" ON stock_distributions;
 CREATE POLICY "Allow all for anon" ON stock_distributions FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all for anon" ON distribution_details;
 CREATE POLICY "Allow all for anon" ON distribution_details FOR ALL USING (true) WITH CHECK (true);

@@ -1,0 +1,11 @@
+-- ============================================
+-- SKIP THIS MIGRATION - Use migration 017 instead
+-- Then import CSV files via Supabase Table Editor
+-- ============================================
+-- This migration is DEPRECATED because ICCID values
+-- exceed BIGINT range and must be stored as TEXT.
+-- See: supabase/migrations/017_fix_esim_table_types.sql
+-- And: supabase/data/paxtel_esims.csv
+--      supabase/data/salamtel_esims.csv
+--      supabase/data/agrotel_esims.csv
+-- ============================================

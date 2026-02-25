@@ -3,6 +3,13 @@
 -- FIX: Column order is (iccid, imsi) not (imsi, iccid)
 -- ============================================
 
+-- Enable RLS on esim_stock
+ALTER TABLE esim_stock ENABLE ROW LEVEL SECURITY;
+
+-- Drop existing policy if exists and recreate
+DROP POLICY IF EXISTS "Allow all for authenticated" ON esim_stock;
+CREATE POLICY "Allow all for authenticated" ON esim_stock FOR ALL USING (true) WITH CHECK (true);
+
 -- PAXTEL eSIMs - FIX: INSERT uses (iccid, imsi) column order
 WITH paxtel_data(imsi, iccid) AS (
   VALUES
