@@ -648,11 +648,12 @@ export function StockDashboard({ stats, mvnos, boxes }: StockDashboardProps) {
       {/* ============================================ */}
       <div className="col-12 col-lg-8">
         <div className="card card-custom">
-          <div className="card-header card-header-custom">
+          <div className="card-header card-header-custom d-flex justify-content-between align-items-center">
             <h5 className="mb-0">
               <i className="bi bi-grid me-2"></i>
               Box Status Overview
             </h5>
+            <span className="badge bg-secondary">{boxes.length} boxes</span>
           </div>
           <div className="card-body p-0">
             <div className="table-responsive">
@@ -668,7 +669,7 @@ export function StockDashboard({ stats, mvnos, boxes }: StockDashboardProps) {
                   </tr>
                 </thead>
                 <tbody>
-                  {boxes.slice(0, 10).map((box, idx) => (
+                  {boxes.map((box, idx) => (
                     <tr key={`${box.box_id}-${idx}`}>
                       <td>
                         <span className="badge bg-primary">{box.mvno}</span>
@@ -708,13 +709,6 @@ export function StockDashboard({ stats, mvnos, boxes }: StockDashboardProps) {
                 </tbody>
               </table>
             </div>
-            {boxes.length > 10 && (
-              <div className="text-center py-3 border-top">
-                <small className="text-muted">
-                  Showing 10 of {boxes.length} boxes
-                </small>
-              </div>
-            )}
           </div>
         </div>
       </div>

@@ -51,6 +51,8 @@ export interface Distributor {
   email: string | null;
   is_active: boolean;
   notes: string | null;
+  request_token: string | null;
+  request_token_expires: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -464,6 +466,10 @@ export interface StockIssuanceRequest {
   notes: string | null;
   created_at: string;
   updated_at: string;
+  // Additional fields for combined view
+  request_type?: 'ISSUANCE' | 'DISTRIBUTOR';
+  distributor_name?: string | null;
+  distributor_id?: string | null;
 }
 
 // ============================================
@@ -490,6 +496,72 @@ export interface DistributionRecord {
   payment_date: string | null;
   invoice_number: string | null;
   distribution_id: string | null;
+}
+
+// ============================================
+// Stock Request Types (External Distributor Requests)
+// ============================================
+
+export type StockRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
+export interface StockRequest {
+  id: string;
+  distributor_id: string | null;
+  mvno_id: string;
+  sim_type: SimType;
+  quantity: number;
+  status: StockRequestStatus;
+  assigned_carton_ids: string[];
+  assigned_box_ids: string[];
+  notes: string | null;
+  requested_at: string;
+  updated_at: string;
+  created_at: string;
+}
+
+export interface MvnoStockRequest {
+  id: string;
+  mvno_id: string;
+  sim_type: SimType;
+  quantity: number;
+  status: StockRequestStatus;
+  notes: string | null;
+  requested_at: string;
+  updated_at: string;
+  created_at: string;
+}
+
+export interface StockIssuance {
+  id: string;
+  request_id: string | null;
+  distributor_id: string | null;
+  mvno_id: string;
+  sim_type: SimType;
+  quantity: number;
+  carton_boxes: any[];
+  status: StockRequestStatus;
+  issued_by: string | null;
+  issued_at: string | null;
+  approved_by: string | null;
+  approved_at: string | null;
+  created_at: string;
+}
+
+// ============================================
+// Notification Types
+// ============================================
+
+export type NotificationType = 'INFO' | 'WARNING' | 'SUCCESS' | 'ERROR';
+
+export interface Notification {
+  id: string;
+  user_id: string | null;
+  title: string;
+  message: string;
+  type: NotificationType;
+  is_read: boolean;
+  link: string | null;
+  created_at: string;
 }
 
 // ============================================

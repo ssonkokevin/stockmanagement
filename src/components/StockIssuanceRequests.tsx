@@ -13,6 +13,10 @@ export function StockIssuanceRequests({ mvnoId, showAll = false }: StockIssuance
   const [loading, setLoading] = useState(true);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [selectedRequest, setSelectedRequest] = useState<StockIssuanceRequest | null>(null);
+  const [showApprovalModal, setShowApprovalModal] = useState(false);
+  const [actionType, setActionType] = useState<'approve' | 'reject'>('approve');
+  const [approvalNotes, setApprovalNotes] = useState('');
 
   // Form state
   const [formData, setFormData] = useState({
@@ -40,7 +44,7 @@ export function StockIssuanceRequests({ mvnoId, showAll = false }: StockIssuance
         setMvnos(mvnosData);
       }
 
-      // Fetch requests
+      // Fetch requests from stock_issuance_requests (MVNO requests to Hamilton)
       let query = supabase
         .from('stock_issuance_requests')
         .select('*')
@@ -59,6 +63,85 @@ export function StockIssuanceRequests({ mvnoId, showAll = false }: StockIssuance
       console.error('Error loading requests:', error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const openApprovalModal = (request: StockIssuanceRequest, action: 'approve' | 'reject') => {
+    setSelectedRequest(request);
+    setActionType(action);
+    setApprovalNotes('');
+    setShowApprovalModal(true);
+  };
+
+  const handleApprove = async () => {
+    if (!selectedRequest) return;
+    
+    try {
+      setSubmitting(true);
+      
+      const storedUser = localStorage.getItem('platform_user');
+      const user = storedUser ? JSON.parse(storedUser) : null;
+
+      if (!user) {
+        alert('Please log in first');
+        return;
+      }
+
+      // Determine next status based on current status
+      let nextStatus = 'LEVEL_1_APPROVED';
+      if (selectedRequest.status === 'LEVEL_1_APPROVED') {
+        nextStatus = 'LEVEL_2_APPROVED';
+      } else if (selectedRequest.status === 'LEVEL_2_APPROVED') {
+        nextStatus = 'COMPLETED';
+      }
+
+      const { error } = await supabase
+        .from('stock_issuance_requests')
+        .update({
+          status: nextStatus,
+          level_1_approver_id: user.id,
+          level_1_approved_at: new Date().toISOString(),
+          notes: approvalNotes || null
+        })
+        .eq('id', selectedRequest.id);
+
+      if (error) throw error;
+
+      alert(`Request ${nextStatus === 'COMPLETED' ? 'completed' : 'approved'} successfully!`);
+      setShowApprovalModal(false);
+      loadData();
+    } catch (error: any) {
+      console.error('Error approving request:', error);
+      alert('Failed to approve: ' + error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleReject = async () => {
+    if (!selectedRequest) return;
+    
+    try {
+      setSubmitting(true);
+
+      const { error } = await supabase
+        .from('stock_issuance_requests')
+        .update({
+          status: 'REJECTED',
+          rejection_reason: approvalNotes
+        })
+        .eq('id', selectedRequest.id);
+
+      if (error) throw error;
+
+      alert('Request rejected!');
+      setShowApprovalModal(false);
+      loadData();
+    } catch (error: any) {
+      console.error('Error rejecting request:', error);
+      alert('Failed to reject: ' + error.message);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -260,6 +343,7 @@ export function StockIssuanceRequests({ mvnoId, showAll = false }: StockIssuance
                     <th className="text-end">Quantity</th>
                     <th>Status</th>
                     <th>Notes</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -283,10 +367,111 @@ export function StockIssuanceRequests({ mvnoId, showAll = false }: StockIssuance
                           {request.notes || '-'}
                         </small>
                       </td>
+                      <td>
+                        {request.status === 'PENDING' || request.status === 'LEVEL_1_APPROVED' ? (
+                          <div className="d-flex gap-1">
+                            <button
+                              className="btn btn-sm btn-success"
+                              onClick={() => openApprovalModal(request, 'approve')}
+                              title={request.status === 'PENDING' ? 'Level 1 Approve' : 'Level 2 Approve'}
+                            >
+                              <i className="bi bi-check-lg"></i>
+                            </button>
+                            <button
+                              className="btn btn-sm btn-danger"
+                              onClick={() => openApprovalModal(request, 'reject')}
+                              title="Reject"
+                            >
+                              <i className="bi bi-x-lg"></i>
+                            </button>
+                          </div>
+                        ) : (
+                          <small className="text-muted">-</small>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Approval Modal */}
+      {showApprovalModal && selectedRequest && (
+        <div className="modal d-block" style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}>
+          <div className="modal-dialog modal-dialog-centered">
+            <div className="modal-content card card-custom">
+              <div className="modal-header card-header card-header-custom">
+                <h5 className="modal-title">
+                  <i className={`bi ${actionType === 'approve' ? 'bi-check-circle' : 'bi-x-circle'} me-2`}></i>
+                  {actionType === 'approve' ? 'Approve' : 'Reject'} Stock Request
+                </h5>
+                <button 
+                  type="button" 
+                  className="btn-close btn-close-white"
+                  onClick={() => setShowApprovalModal(false)}
+                ></button>
+              </div>
+              <div className="modal-body">
+                <div className="alert alert-info mb-3">
+                  <strong>Request Details:</strong><br/>
+                  MVNO: {mvnos.find(m => m.id === selectedRequest.mvno_id)?.name || 'Unknown'}<br/>
+                  SIM Type: {selectedRequest.sim_type}<br/>
+                  Quantity: {selectedRequest.quantity}
+                </div>
+                
+                {actionType === 'approve' ? (
+                  <p className="mb-3">
+                    This will advance the request to: 
+                    <strong>
+                      {selectedRequest.status === 'PENDING' ? 'LEVEL_1_APPROVED' : 
+                       selectedRequest.status === 'LEVEL_1_APPROVED' ? 'LEVEL_2_APPROVED' : 'COMPLETED'}
+                    </strong>
+                  </p>
+                ) : (
+                  <p className="mb-3 text-danger">
+                    This will <strong>reject</strong> the stock request.
+                  </p>
+                )}
+
+                <div className="mb-3">
+                  <label className="form-label">Notes (Optional)</label>
+                  <textarea
+                    className="form-control"
+                    rows={3}
+                    value={approvalNotes}
+                    onChange={(e) => setApprovalNotes(e.target.value)}
+                    placeholder={actionType === 'reject' ? 'Reason for rejection...' : 'Additional notes...'}
+                  />
+                </div>
+              </div>
+              <div className="modal-footer">
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => setShowApprovalModal(false)}
+                >
+                  Cancel
+                </button>
+                {actionType === 'approve' ? (
+                  <button
+                    className="btn btn-success"
+                    onClick={handleApprove}
+                    disabled={submitting}
+                  >
+                    {submitting ? 'Processing...' : 'Confirm Approval'}
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-danger"
+                    onClick={handleReject}
+                    disabled={submitting}
+                  >
+                    {submitting ? 'Processing...' : 'Confirm Rejection'}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>

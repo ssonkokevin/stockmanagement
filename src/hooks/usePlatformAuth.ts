@@ -106,33 +106,54 @@ export function usePlatformAuth() {
     try {
       // For demo, check against platform_users table
       // In production, use Supabase Auth
+      console.log('Attempting login for:', email);
+      
       const { data, error } = await supabase
         .from('platform_users')
         .select('*')
-        .eq('email', email)
-        .single();
+        .eq('email', email);
 
-      if (error || !data) {
+      console.log('Login query result:', { data, error, count: data?.length });
+
+      if (error) {
+        console.error('Supabase error:', error);
+        return { success: false, message: `Error: ${error.message}` };
+      }
+
+      if (!data || data.length === 0) {
+        return { success: false, message: 'User not found. Please check your email.' };
+      }
+
+      if (data.length > 1) {
+        console.warn('Multiple users found with same email:', data.length);
+      }
+
+      // Get the first user (should only be one due to unique email constraint)
+      const userData = data[0];
+
+      // Verify password against stored hash
+      if (userData.password_hash !== password) {
         return { success: false, message: 'Invalid credentials' };
       }
 
-      // Simple password check (in production, use proper hashing)
-      // For demo purposes, accept any password for existing users
-      // In production: const passwordHash = await hash(password, 10);
+      // Check if user is active
+      if (!userData.is_active) {
+        return { success: false, message: 'Account is disabled. Contact administrator.' };
+      }
       
       // Store in localStorage for demo
-      localStorage.setItem('platform_user', JSON.stringify(data));
+      localStorage.setItem('platform_user', JSON.stringify(userData));
       
       setAuthState({
-        user: data,
+        user: userData,
         isLoading: false,
         isAuthenticated: true,
-        role: data.role,
-        mvnoId: data.mvno_id,
-        isSuperAdmin: data.role === 'SUPER_ADMIN',
-        isManagement: data.role === 'MANAGEMENT',
-        isMvnoAdmin: data.role === 'MVNO_ADMIN',
-        isDistributor: data.role === 'DISTRIBUTOR',
+        role: userData.role,
+        mvnoId: userData.mvno_id,
+        isSuperAdmin: userData.role === 'SUPER_ADMIN',
+        isManagement: userData.role === 'MANAGEMENT',
+        isMvnoAdmin: userData.role === 'MVNO_ADMIN',
+        isDistributor: userData.role === 'DISTRIBUTOR',
       });
 
       return { success: true, message: 'Login successful' };
