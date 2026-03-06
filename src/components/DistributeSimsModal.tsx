@@ -163,7 +163,7 @@ export function DistributeSimsModal({ distributor, onSuccess, onCancel }: Distri
         .from('esim_stock')
         .select('id, iccid, imsi, status')
         .eq('operator', operator)
-        .eq('status', 'available')
+        .eq('status', 'IN_STOCK')
         .ilike('iccid', `%${esimSearch}%`)
         .limit(50);
       

@@ -442,10 +442,23 @@ export interface BossSyncLog {
 }
 
 // ============================================
-// Stock Issuance Request Types (Dual Approval)
+// Stock Issuance Request Types (Dual Approval) - STRICT STATE MACHINE
 // ============================================
 
-export type IssuanceRequestStatus = 'PENDING' | 'LEVEL_1_APPROVED' | 'LEVEL_2_APPROVED' | 'COMPLETED' | 'REJECTED';
+export enum StockStatus {
+  PENDING = 'PENDING',
+  READY_FOR_APPROVAL = 'READY_FOR_APPROVAL',
+  LEVEL_1_APPROVED = 'LEVEL_1_APPROVED',
+  LEVEL_2_APPROVED = 'LEVEL_2_APPROVED',
+  STOCK_ISSUED = 'STOCK_ISSUED',
+  REJECTED = 'REJECTED'
+}
+
+// Legacy type for backward compatibility (deprecated - use StockStatus enum)
+export type IssuanceRequestStatus = StockStatus | 'READY_FOR_APPROVAL' | 'PENDING_LEVEL_1_APPROVAL' | 'PENDING_LEVEL_2_APPROVAL';
+
+// Role types for approval workflow
+export type ManagementRole = 'SUPER_ADMIN' | 'MANAGEMENT_LEVEL_1' | 'MANAGEMENT_LEVEL_2';
 
 export interface StockIssuanceRequest {
   id: string;
@@ -453,17 +466,23 @@ export interface StockIssuanceRequest {
   requester_id: string;
   sim_type: SimType;
   quantity: number;
-  status: IssuanceRequestStatus;
+  status: StockStatus;  // Use strict enum
+  assigned_box_ids: string[] | null;
+  assigned_box_quantities: any[] | null;  // JSONB with box_id, quantity, iccid_start, iccid_end
+  assigned_esim_iccids: string[] | null;
   level_1_approver_id: string | null;
   level_1_approved_at: string | null;
   level_1_approval_token: string | null;
   level_1_token_expires: string | null;
+  level_1_approver_email: string | null;
   level_2_approver_id: string | null;
   level_2_approved_at: string | null;
   level_2_approval_token: string | null;
   level_2_token_expires: string | null;
+  level_2_approver_email: string | null;
   rejection_reason: string | null;
   notes: string | null;
+  completion_record: any | null;  // JSONB with completion details
   created_at: string;
   updated_at: string;
   // Additional fields for combined view

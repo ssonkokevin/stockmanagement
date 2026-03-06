@@ -13,9 +13,10 @@ import { StockIssuanceRequests } from './components/StockIssuanceRequests';
 import { LoginModal } from './components/LoginModal';
 import { RequestLinkGenerator } from './components/RequestLinkGenerator';
 import { DistributorStockRequests } from './components/DistributorStockRequests';
+import { ApproveStock } from './components/ApproveStock';
 import type { SimStatus, BoxStockSummary, Distributor, Mvno } from './types/simcard';
 
-type TabType = 'dashboard' | 'distribute' | 'history' | 'distributors' | 'esim' | 'superadmin' | 'stockrequests' | 'distributorrequests';
+type TabType = 'dashboard' | 'distribute' | 'history' | 'distributors' | 'esim' | 'superadmin' | 'stockrequests' | 'distributorrequests' | 'approvestock';
 
 function App() {
   // Platform auth - for MVNE multi-tenant features
@@ -308,6 +309,15 @@ function App() {
                 >
                   <i className="bi bi-file-earmark-plus me-2"></i>
                   Stock Requests
+                </button>
+              </li>
+              <li className="nav-item">
+                <button 
+                  className={`nav-link sidebar-link ${activeTab === 'approvestock' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('approvestock')}
+                >
+                  <i className="bi bi-check2-square me-2"></i>
+                  Approve Stock
                 </button>
               </li>
               <li className="nav-item">
@@ -817,6 +827,11 @@ function App() {
         {/* Stock Issuance Requests Tab */}
         {activeTab === 'stockrequests' && (
           <StockIssuanceRequests mvnoId={platformUser?.mvno_id || undefined} showAll={isSuperAdmin} />
+        )}
+
+        {/* Approve Stock Tab */}
+        {activeTab === 'approvestock' && (
+          <ApproveStock />
         )}
 
         {/* Distributor Stock Requests Tab */}
