@@ -5,6 +5,7 @@ import { Dashboard } from './pages/Dashboard';
 import { StockRequests } from './pages/StockRequests';
 import { ApproveRequests } from './pages/ApproveRequests';
 import { useAppStore } from './store/useAppStore';
+import { useSocket } from './hooks/useSocket';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = useAppStore((s) => s.authToken);
@@ -16,6 +17,8 @@ export default function App() {
   const token = useAppStore((s) => s.authToken);
   const setToken = useAppStore((s) => s.setToken);
   const setUser = useAppStore((s) => s.setUser);
+
+  useSocket();
 
   // Check token expiry on mount
   useEffect(() => {
