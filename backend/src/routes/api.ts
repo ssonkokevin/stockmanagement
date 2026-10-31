@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { v4 as uuidv4 } from 'uuid';
+import multer from 'multer';
 import * as stockService from '../services/stock.service.js';
+import * as onboardingService from '../services/onboarding.service.js';
 import * as emailService from '../services/email.service.js';
 import { config } from '../config/index.js';
 import { query } from '../config/database.js';
@@ -12,9 +13,54 @@ import { appendUnifiedLog, formatLogTimestamp, logFrontendActivity, logLine, toL
 import { getIo } from '../socket.js';
 
 const router = Router();
+const upload = multer({ storage: multer.memoryStorage() });
 let bossSyncDeprecationLogged = false;
 
-function ok<T>(res: Response, data: T, message: string | null = null) {
+// ...
+
+// ==================== ONBOARDING DOCUMENT UPLOAD ====================
+router.post('/onboarding/upload-document', upload.single('file'), async (req: Request, res: Response) => {
+  const file = req.file;
+  try {
+    if (!file) return fail(res, 400, 'No file uploaded');
+
+    if (!onboardingService.ONBOARDING_DOCUMENTS_MIME_TYPES.includes(file.mimetype)) {
+      return fail(res, 400, `Unsupported file type: ${file.mimetype}`);
+    }
+    if (file.size > onboardingService.ONBOARDING_DOCUMENTS_MAX_SIZE_BYTES) {
+      return fail(res, 400, 'File exceeds the 10MB size limit');
+    }
+
+    const fileExt = path.extname(file.originalname);
+    // Deterministic, content-addressed path: identical file content always hashes to the
+    // same path, so re-uploading the same document never creates a duplicate file on disk.
+    const contentHash = crypto.createHash('sha256').update(file.buffer).digest('hex');
+    const relativePath = `${onboardingService.ONBOARDING_DOCUMENTS_DIR}/${contentHash}${fileExt}`;
+    const dirPath = path.join(process.cwd(), 'uploads', onboardingService.ONBOARDING_DOCUMENTS_DIR);
+    const filePath = path.join(dirPath, `${contentHash}${fileExt}`);
+    const sizeKb = (file.size / 1024).toFixed(1);
+
+    logLine('INF', 'LOCAL_UPLOAD', `[LOCAL UPLOAD] Starting upload -> dir="${onboardingService.ONBOARDING_DOCUMENTS_DIR}" file="${file.originalname}" hash="${contentHash.slice(0, 12)}…" type=${file.mimetype} size=${sizeKb}KB`);
+
+    const deduped = fs.existsSync(filePath);
+    if (deduped) {
+      logLine('INF', 'LOCAL_UPLOAD', `[LOCAL UPLOAD] ♻️ Duplicate content detected -> file="${file.originalname}" hash="${contentHash.slice(0, 12)}…" (reusing existing file, no new write)`);
+    } else {
+      fs.mkdirSync(dirPath, { recursive: true });
+      fs.writeFileSync(filePath, file.buffer);
+    }
+
+    const url = `/uploads/${relativePath}`;
+    logLine('INF', 'LOCAL_UPLOAD', `[LOCAL UPLOAD] ✅ ${deduped ? 'Reused existing file' : 'Success'} -> file="${file.originalname}" url="${url}"`);
+
+    return ok(res, { url, name: file.originalname, deduped });
+  } catch (e: any) {
+    logLine('ERR', 'LOCAL_UPLOAD', `[LOCAL UPLOAD] ❌ Failed -> file="${file?.originalname || 'unknown'}" error=${e.message}`);
+    return fail(res, 500, e?.message || 'File upload failed');
+  }
+});
+
+function ok(res: Response, data: any, message?: string) {
   const traceId = String(res.locals?.traceId || 'n/a');
   return res.json({ success: true, data, message, trace_id: traceId });
 }
@@ -77,6 +123,9 @@ export function jwtMiddleware(req: Request, res: Response, next: NextFunction): 
   }
   next();
 }
+
+// Populate req.auth from Bearer token (soft — routes decide if auth is required via requireAuth()).
+router.use(jwtMiddleware);
 
 // ==================== AUTH ROUTES ====================
 
@@ -540,7 +589,7 @@ router.get('/platform-users', async (req: Request, res: Response) => {
 // Box stock summary (physical)
 router.get('/box-stock-summary', async (req: Request, res: Response) => {
   try {
-    const { limit, offset, search, carton_number, box_number, mvno, status, iccid_from, iccid_to } = req.query;
+    const { limit, offset, search, carton_number, box_number, mvno, mvno_id, status, iccid_from, iccid_to } = req.query;
     const rows = await stockService.getBoxStockSummary({
       limit: limit ? parseInt(String(limit)) : undefined,
       offset: offset ? parseInt(String(offset)) : undefined,
@@ -548,6 +597,7 @@ router.get('/box-stock-summary', async (req: Request, res: Response) => {
       carton_number: carton_number ? String(carton_number) : undefined,
       box_number: box_number ? String(box_number) : undefined,
       mvno: mvno ? String(mvno) : undefined,
+      mvno_id: mvno_id ? String(mvno_id) : undefined,
       status: status ? String(status) : undefined,
       iccid_from: iccid_from ? String(iccid_from) : undefined,
       iccid_to: iccid_to ? String(iccid_to) : undefined,
@@ -560,12 +610,13 @@ router.get('/box-stock-summary', async (req: Request, res: Response) => {
 
 router.get('/box-stock-summary/count', async (req: Request, res: Response) => {
   try {
-    const { search, carton_number, box_number, mvno, status, iccid_from, iccid_to } = req.query;
+    const { search, carton_number, box_number, mvno, mvno_id, status, iccid_from, iccid_to } = req.query;
     const count = await stockService.getBoxStockSummaryCount({
       search: search ? String(search) : undefined,
       carton_number: carton_number ? String(carton_number) : undefined,
       box_number: box_number ? String(box_number) : undefined,
       mvno: mvno ? String(mvno) : undefined,
+      mvno_id: mvno_id ? String(mvno_id) : undefined,
       status: status ? String(status) : undefined,
       iccid_from: iccid_from ? String(iccid_from) : undefined,
       iccid_to: iccid_to ? String(iccid_to) : undefined,
@@ -906,7 +957,8 @@ router.post('/requests', async (req: Request, res: Response) => {
 // Request approval tokens for a stock issuance request
 router.post('/request-approval', async (req: Request, res: Response) => {
   try {
-    const { requestId } = req.body;
+    const { requestId, approvers } = req.body;
+    // approvers: Array<{ name: string; email: string }> — optional, overrides saved emails
 
     logLine('INF', 'APPROVAL', `request-approval received for request ${String(requestId || '')}`);
     
@@ -932,19 +984,32 @@ router.post('/request-approval', async (req: Request, res: Response) => {
       distributorName = distributor?.name || 'N/A';
     }
     
-    // Get box details
+    // Get box details — query directly by box ID so reserved/issued boxes are still found
     let assignedBoxes: any[] = [];
     if (stockRequest.assigned_box_quantities && stockRequest.assigned_box_quantities.length > 0) {
-      const boxes = await stockService.getBoxes();
-      assignedBoxes = stockRequest.assigned_box_quantities.map((box: any) => {
-        const boxInfo = boxes.find((b: any) => b.box_id === box.box_id || b.id === box.box_id);
-        return {
-          box_id: box.box_id,
-          box_number: boxInfo?.box_number || null,
-          carton_number: boxInfo?.carton_number || null,
-          quantity: box.quantity
-        };
-      });
+      const boxIds = stockRequest.assigned_box_quantities.map((b: any) => b.box_id).filter(Boolean);
+      if (boxIds.length > 0) {
+        const boxRows = await query(
+          `SELECT b.id, b.box_number, c.carton_number,
+                  b.iccid_start, b.iccid_end
+             FROM boxes b
+             LEFT JOIN cartons c ON b.carton_id = c.id
+            WHERE b.id = ANY($1::uuid[])`,
+          [boxIds]
+        );
+        const boxMap = new Map(boxRows.rows.map((r: any) => [r.id, r]));
+        assignedBoxes = stockRequest.assigned_box_quantities.map((box: any) => {
+          const boxInfo: any = boxMap.get(box.box_id) || {};
+          return {
+            box_id:       box.box_id,
+            box_number:   boxInfo.box_number   ? String(boxInfo.box_number)   : null,
+            carton_number: boxInfo.carton_number || null,
+            quantity:     box.quantity,
+            iccid_start:  boxInfo.iccid_start  || null,
+            iccid_end:    boxInfo.iccid_end     || null,
+          };
+        });
+      }
     }
     
     // Get eSIM ICCIDs
@@ -953,6 +1018,37 @@ router.post('/request-approval', async (req: Request, res: Response) => {
       assignedEsims = stockRequest.assigned_esim_iccids;
     }
     
+    // If approvers were sent from the portal, update the request before generating tokens
+    if (approvers && Array.isArray(approvers) && approvers.length >= 1) {
+      const level1 = approvers[0];
+      const level2 = approvers[1] || approvers[0];
+      // Try with name columns first; fall back without them if migration hasn't run
+      try {
+        await query(
+          `UPDATE stock_issuance_requests
+             SET level_1_approver_email = $2,
+                 level_2_approver_email = $3,
+                 level_1_approver_name  = $4,
+                 level_2_approver_name  = $5,
+                 updated_at = NOW()
+           WHERE id = $1`,
+          [requestId,
+           level1.email || null, level2.email || null,
+           level1.name  || null, level2.name  || null]
+        );
+      } catch (_) {
+        // Name columns may not exist yet — fall back to email-only update
+        await query(
+          `UPDATE stock_issuance_requests
+             SET level_1_approver_email = $2,
+                 level_2_approver_email = $3,
+                 updated_at = NOW()
+           WHERE id = $1`,
+          [requestId, level1.email || null, level2.email || null]
+        );
+      }
+    }
+
     // Create approval tokens
     const tokens = await stockService.createApprovalTokens(requestId);
     logLine('INF', 'APPROVAL', `created ${tokens.length} approval tokens for request ${requestId}`);
@@ -967,13 +1063,25 @@ router.post('/request-approval', async (req: Request, res: Response) => {
     
     // Send approval emails to each approver
     const emailResults: Array<{ approver_role: string; approver_email: string; sent: boolean }> = [];
+    // Build name lookup from portal-submitted approvers
+    const approverNameMap: Record<string, string> = {};
+    if (approvers && Array.isArray(approvers)) {
+      approvers.forEach((a: any) => {
+        if (a.email && a.name) approverNameMap[a.email.toLowerCase()] = a.name;
+      });
+    }
+
     for (const token of tokens) {
+      const approverName = approverNameMap[token.approver_email?.toLowerCase()] ||
+        (token.approver_role === 'LEVEL_1' ? (stockRequest as any).level_1_approver_name : (stockRequest as any).level_2_approver_name) ||
+        null;
       const sent = await emailService.sendApprovalEmail(
         {
           token: token.token,
           request_id: requestId,
           approver_email: token.approver_email,
           approver_role: token.approver_role,
+          approver_name: approverName,
           status: 'pending',
           expires_at: token.expires_at,
           created_at: stockRequest.created_at,
@@ -987,7 +1095,8 @@ router.post('/request-approval', async (req: Request, res: Response) => {
           assigned_boxes: assignedBoxes,
           assigned_esims: assignedEsims,
         },
-        config.app.baseUrl
+        config.app.baseUrl,
+        req.headers
       );
       emailResults.push({
         approver_role: token.approver_role,
@@ -1139,6 +1248,46 @@ router.get('/approve', async (req: Request, res: Response) => {
   }
 });
 
+// Look up approver email from a token (no auth required — used by email link flow)
+router.get('/approval/token-info/:token', async (req: Request, res: Response) => {
+  try {
+    const { token } = req.params;
+    if (!token) return fail(res, 400, 'token required');
+    const result = await query(
+      `SELECT approver_email AS email, approver_role AS role, expires_at, status
+         FROM approval_tokens
+        WHERE token = $1
+        LIMIT 1`,
+      [token]
+    );
+    if (!result.rows[0]) return fail(res, 404, 'Token not found or expired');
+    const row = result.rows[0];
+    if (row.status === 'expired' || new Date(row.expires_at) < new Date()) {
+      return fail(res, 410, 'Token has expired');
+    }
+    // Try to look up the approver name — silently skip if columns don't exist yet
+    let approverName: string | null = null;
+    try {
+      const reqRow = await query(
+        `SELECT sir.level_1_approver_name, sir.level_2_approver_name
+           FROM stock_issuance_requests sir
+           JOIN stock_approval_tokens sat ON sat.request_id = sir.id
+          WHERE sat.token = $1
+          LIMIT 1`,
+        [token]
+      );
+      if (reqRow.rows[0]) {
+        approverName = row.role === 'LEVEL_1'
+          ? reqRow.rows[0].level_1_approver_name
+          : reqRow.rows[0].level_2_approver_name;
+      }
+    } catch (_) { /* columns may not exist yet — name will be null */ }
+    return ok(res, { email: row.email, role: row.role, name: approverName });
+  } catch (error: any) {
+    return fail(res, 500, error.message);
+  }
+});
+
 // Verify and process approval token
 router.post('/approve/verify', async (req: Request, res: Response) => {
   try {
@@ -1164,20 +1313,93 @@ router.post('/approve/verify', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: validation.rows[0]?.message || 'Invalid token' });
     }
     
+    const requestId = validation.rows[0].request_id;
+    const approverEmail = (validation.rows[0].email || '').toLowerCase();
+
     // Log the action
     await stockService.addAuditLog(
-      validation.rows[0].request_id,
+      requestId,
       action === 'approve' ? 'EMAIL_APPROVED' : 'EMAIL_REJECTED',
-      { email: validation.rows[0].email, action }
+      { email: approverEmail, action }
     );
 
-    logLine('INF', 'EMAIL_APPROVAL', `approve/verify recorded ${action} for request ${validation.rows[0].request_id}`);
-    
-    // The background checker will update the status based on consensus
-    res.json({ 
-      success: true, 
-      message: validation.rows[0].message,
-      request_id: validation.rows[0].request_id
+    logLine('INF', 'EMAIL_APPROVAL', `approve/verify recorded ${action} for request ${requestId}`);
+
+    // ── Sync into approval_responses so the consensus check can see this vote ──
+    const actionStatus = action === 'approve' ? 'APPROVED' : 'REJECTED';
+    await query(
+      `INSERT INTO approval_responses (request_id, email, status, responded_at, updated_at, token)
+       VALUES ($1, $2, $3, NOW(), NOW(), $4)
+       ON CONFLICT (request_id, email)
+       DO UPDATE SET status = EXCLUDED.status, responded_at = NOW(), updated_at = NOW()`,
+      [requestId, approverEmail, actionStatus, token]
+    );
+
+    // ── Update the approver slot timestamp on the request ──
+    const reqRow = await query(
+      `SELECT level_1_approver_email, level_2_approver_email FROM stock_issuance_requests WHERE id = $1`,
+      [requestId]
+    );
+    const l1 = (reqRow.rows[0]?.level_1_approver_email || '').toLowerCase();
+    const l2 = (reqRow.rows[0]?.level_2_approver_email || '').toLowerCase();
+    if (approverEmail === l1) {
+      await query(
+        `UPDATE stock_issuance_requests SET level_1_approved_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [requestId]
+      );
+    } else if (approverEmail === l2) {
+      await query(
+        `UPDATE stock_issuance_requests SET level_2_approved_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [requestId]
+      );
+    }
+
+    // ── Inline consensus check ──
+    // Deduplicate so 1-approver flows (l1 === l2) complete on a single approval
+    const approverEmails = [...new Set([l1, l2].filter(Boolean))];
+    const allResponses = await query(
+      `SELECT LOWER(email) AS email, status FROM approval_responses
+        WHERE request_id = $1 AND LOWER(email) = ANY($2::text[])`,
+      [requestId, approverEmails]
+    );
+    const approvedCount = allResponses.rows.filter((r: any) => r.status === 'APPROVED').length;
+    const rejectedCount = allResponses.rows.filter((r: any) => r.status === 'REJECTED').length;
+
+    let consensusReached = false;
+    let finalStatus: string | null = null;
+
+    if (rejectedCount > 0) {
+      await query(`UPDATE stock_issuance_requests SET status = 'REJECTED', updated_at = NOW() WHERE id = $1`, [requestId]);
+      finalStatus = 'REJECTED';
+      consensusReached = true;
+      logLine('WRN', 'APPROVAL', `Request ${requestId} REJECTED by email-flow consensus`);
+    } else if (approverEmails.length > 0 && approvedCount >= approverEmails.length) {
+      logLine('INF', 'APPROVAL', `Request ${requestId} fully approved via email (${approvedCount}/${approverEmails.length}). Issuing stock...`);
+      try {
+        const result = await stockService.issueApprovedStockRequest(requestId);
+        finalStatus = 'COMPLETED';
+        consensusReached = true;
+        logLine('INF', 'APPROVAL', `Request ${requestId} COMPLETED via email flow. PDF: ${result.pdf_url || 'none'}`);
+      } catch (issueErr: any) {
+        logLine('ERR', 'APPROVAL', `Email-flow issuance failed for ${requestId}: ${issueErr.message}`);
+        await query(`UPDATE stock_issuance_requests SET status = 'READY_FOR_APPROVAL', updated_at = NOW() WHERE id = $1`, [requestId]);
+      }
+    }
+
+    const remaining = approverEmails.length - approvedCount;
+    const message = consensusReached
+      ? (finalStatus === 'COMPLETED' ? 'Stock Issued — Request Approved Successfully' : `Request ${finalStatus}`)
+      : remaining > 0
+        ? `Approval recorded (${approvedCount}/${approverEmails.length}). Waiting for ${remaining} more approver${remaining > 1 ? 's' : ''}.`
+        : 'Approval recorded.';
+
+    res.json({
+      success: true,
+      message,
+      request_id: requestId,
+      consensus_reached: consensusReached,
+      final_status: finalStatus,
+      approvals: { count: approvedCount, needed: approverEmails.length || 2 },
     });
   } catch (error: any) {
     logLine('ERR', 'EMAIL_APPROVAL', `approve/verify error: ${String(error?.message || error)}`);
@@ -1232,19 +1454,51 @@ router.post('/stock/approve-l1/:id', async (req: Request, res: Response) => {
       }
 
       if (level2Token?.token) {
+        // Fetch stock details for the email (query boxes directly so reserved boxes are found)
+        const l2Request = await stockService.getStockIssuanceRequestById(requestId) as any;
+        const l2Mvnos = await stockService.getMvnos();
+        const l2Mvno = l2Mvnos.find((m: any) => m.id === l2Request?.mvno_id);
+        let l2AssignedBoxes: any[] = [];
+        const l2BoxQtys: any[] = Array.isArray(l2Request?.assigned_box_quantities) ? l2Request.assigned_box_quantities : [];
+        if (l2BoxQtys.length > 0) {
+          const boxIds = l2BoxQtys.map((b: any) => b.box_id).filter(Boolean);
+          if (boxIds.length > 0) {
+            const boxRows = await query(
+              `SELECT b.id, b.box_number, c.carton_number, b.iccid_start, b.iccid_end
+                 FROM boxes b LEFT JOIN cartons c ON b.carton_id = c.id
+                WHERE b.id = ANY($1::uuid[])`,
+              [boxIds]
+            );
+            const boxMap = new Map(boxRows.rows.map((r: any) => [r.id, r]));
+            l2AssignedBoxes = l2BoxQtys.map((box: any) => {
+              const bi: any = boxMap.get(box.box_id) || {};
+              return { box_id: box.box_id, box_number: bi.box_number ? String(bi.box_number) : null,
+                       carton_number: bi.carton_number || null, quantity: box.quantity,
+                       iccid_start: bi.iccid_start || null, iccid_end: bi.iccid_end || null };
+            });
+          }
+        }
+        const l2AssignedEsims: string[] = Array.isArray(l2Request?.assigned_esim_iccids) ? l2Request.assigned_esim_iccids : [];
+
         const sent = await emailService.sendApprovalEmail(
           {
             token: level2Token.token,
             request_id: requestId,
             approver_email: level2Approver.approver_email,
             approver_role: level2Approver.approver_role || 'LEVEL_2',
-            approver_name: level2Approver.approver_name,
             status: 'pending',
             expires_at: level2Token.expires_at,
             created_at: level2Token.created_at,
             updated_at: (level2Token as any).updated_at || level2Token.created_at,
+            mvno_name: l2Mvno?.name || l2Request?.mvno_id,
+            mvno_id: l2Request?.mvno_id,
+            sim_type: l2Request?.sim_type,
+            quantity: l2Request?.quantity,
+            assigned_boxes: l2AssignedBoxes,
+            assigned_esims: l2AssignedEsims,
           },
-          config.app.baseUrl
+          config.app.baseUrl,
+          req.headers
         );
         if (!sent) {
           logLine('WRN', 'APPROVAL', `Failed to send Level 2 approval email for request ${requestId}`);
@@ -1375,6 +1629,61 @@ router.post('/stock/cancel/:id', async (req: Request, res: Response) => {
   }
 });
 
+// Reset stock assignment — clears boxes/eSIMs and sets status back to PENDING
+router.post('/stock/reset-assignment/:id', async (req: Request, res: Response) => {
+  try {
+    const requestId = req.params.id as string;
+    const { resetBy } = req.body;
+    if (!requestId) return fail(res, 400, 'requestId is required');
+
+    // Return any reserved/issued boxes back to the pool first
+    const reqRow = await query(
+      `SELECT assigned_box_quantities, assigned_esim_iccids FROM stock_issuance_requests WHERE id = $1`,
+      [requestId]
+    );
+    if (!reqRow.rows[0]) return fail(res, 404, 'Request not found');
+
+    const boxQtys: any[] = reqRow.rows[0].assigned_box_quantities || [];
+    for (const bq of boxQtys) {
+      if (bq.box_id) {
+        await query(
+          `UPDATE boxes SET status = 'AVAILABLE', reserved_quantity = 0 WHERE id = $1`,
+          [bq.box_id]
+        ).catch(() => {/* ignore if box table differs */});
+      }
+    }
+
+    // Return eSIMs to available pool
+    const esimIccids: string[] = reqRow.rows[0].assigned_esim_iccids || [];
+    if (esimIccids.length > 0) {
+      await query(
+        `UPDATE esims SET status = 'AVAILABLE', allocated_request_id = NULL WHERE iccid = ANY($1::text[])`,
+        [esimIccids]
+      ).catch(() => {});
+    }
+
+    await query(
+      `UPDATE stock_issuance_requests
+          SET assigned_box_quantities = '[]'::jsonb,
+              assigned_esim_iccids    = '[]'::jsonb,
+              status                  = 'PENDING',
+              updated_at              = NOW()
+        WHERE id = $1`,
+      [requestId]
+    );
+
+    await stockService.addAuditLog(requestId, 'ASSIGNMENT_RESET', {
+      reset_by: resetBy || 'unknown',
+      message: 'Stock assignment cleared — request reset to PENDING for re-assignment',
+    });
+
+    logLine('INF', 'STOCK', `Assignment reset for request ${requestId} by ${resetBy || 'unknown'}`);
+    return ok(res, { message: 'Assignment cleared. Request is back in Pending for re-assignment.' });
+  } catch (error: any) {
+    fail(res, 500, error.message);
+  }
+});
+
 router.post('/stock/reverse-distribution/:id', async (req: Request, res: Response) => {
   try {
     const recordId = req.params.id as string;
@@ -1416,6 +1725,10 @@ router.post('/stock/reverse-distribution/:id', async (req: Request, res: Respons
 // PDF Generation & Viewing — returns real PDF binary with proper headers
 router.get('/pdf/view/:id', async (req: Request, res: Response) => {
   try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
     const recordId = req.params.id as string;
     // Look up by request_id, manual_request_id, or id — the frontend passes COALESCE(request_id, manual_request_id)
     const phResult = await query(
@@ -1487,9 +1800,10 @@ router.get('/pdf/view/:id', async (req: Request, res: Response) => {
       contact_email: distributorEmail || null,
     });
 
+    const disposition = req.query.download === '1' ? 'attachment' : 'inline';
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="pick-form-${recordId}.pdf"`);
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Content-Disposition', `${disposition}; filename="pick-form-${recordId}.pdf"`);
+    res.setHeader('Cache-Control', 'private, no-cache');
     res.send(pdfBuffer);
   } catch (err: any) {
     fail(res, 500, err.message);
@@ -1839,9 +2153,10 @@ router.post('/send-approval-emails', async (req: Request, res: Response) => {
           assigned_boxes: assignedBoxes,
           assigned_esims: assignedEsims
         },
-        config.app.baseUrl
+        config.app.baseUrl,
+        req.headers
       );
-      
+
       approvalResults.push({
         email: approver.approver_email,
         sent: emailSent,
@@ -3147,24 +3462,116 @@ router.get('/approvers', async (req: Request, res: Response) => {
 // Receive frontend logs
 router.post('/logs/frontend', async (req: Request, res: Response) => {
   try {
-    const { level, message, page, user, trace_id, user_agent } = req.body;
+    const {
+      level, message, page, user, trace_id, user_agent,
+      category, duration_ms, stack, route, event_type,
+    } = req.body;
     const traceId = String(res.locals?.traceId || trace_id || 'n/a');
-    const userAgent = String(user_agent || req.headers['user-agent'] || 'unknown');
-    logFrontendActivity(
-      level,
-      page,
-      `[trace:${traceId}] ${String(message || '')} ua="${userAgent}"`,
-      user ? String(user) : undefined
-    );
-    const mirrorLine = `${formatLogTimestamp(new Date())} [${toLevel(level)}] FRONTEND [trace:${traceId}] ${String(page || 'unknown')}: ${String(message || '')}`;
-    console.log(mirrorLine);
+
+    const cat = String(category || 'FRONTEND').toUpperCase();
+    const msgParts = [String(message || '')];
+    if (route) msgParts.push(`route=${route}`);
+    if (event_type) msgParts.push(`event=${event_type}`);
+    if (stack) msgParts.push(`stack=${String(stack).slice(0, 300)}`);
+
+    logLine(toLevel(level), cat, `${String(page || 'unknown')}: ${msgParts.join(' ')}`, {
+      trace: traceId,
+      user: user ? String(user) : undefined,
+      duration_ms: duration_ms ? Number(duration_ms) : undefined,
+    });
 
     res.json({ success: true, trace_id: traceId });
   } catch (error: any) {
     const traceId = String(res.locals?.traceId || 'n/a');
-    console.error('Failed to log frontend activity:', error);
-    appendUnifiedLog(`${formatLogTimestamp(new Date())} [ERR] FRONTEND_LOGGING [trace:${traceId}] Failed to persist frontend log: ${String(error?.message || error)}`);
+    appendUnifiedLog(`${formatLogTimestamp(new Date())} | ERR | FRONTEND     | Failed to persist frontend log: ${String(error?.message || error)}`);
     res.status(500).json({ success: false, error: error.message, trace_id: traceId });
+  }
+});
+
+// Observability: summary of recent log activity for the admin dashboard
+router.get('/observability/summary', async (req: Request, res: Response) => {
+  try {
+    const logsDir = path.join(process.cwd(), 'logs');
+    const todayKey = (() => {
+      const d = new Date();
+      return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+    })();
+    const todayLog = path.join(logsDir, `Hamilton-log-${todayKey}.txt`);
+    const errorsLog = path.join(logsDir, 'errors.log');
+    const auditLog = path.join(logsDir, 'audit.log');
+
+    function readTail(filePath: string, n = 200): string[] {
+      try {
+        if (!fs.existsSync(filePath)) return [];
+        const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean);
+        return lines.slice(-n);
+      } catch { return []; }
+    }
+
+    function countMatches(lines: string[], pattern: string): number {
+      return lines.filter(l => l.includes(pattern)).length;
+    }
+
+    const todayLines = readTail(todayLog, 2000);
+    const errorLines = readTail(errorsLog, 100);
+    const auditLines = readTail(auditLog, 100);
+
+    // Count errors today
+    const errorsToday = countMatches(todayLines, '| ERR |');
+    const warnsToday  = countMatches(todayLines, '| WRN |');
+
+    // Slow requests today
+    const slowRequests = todayLines.filter(l => l.includes('SLOW '));
+
+    // Business events today
+    const businessEvents = todayLines
+      .filter(l => l.includes('| BUSINESS'))
+      .slice(-20)
+      .map(l => ({ ts: l.slice(0, 23), line: l }));
+
+    // Recent errors (last 20)
+    const recentErrors = errorLines.slice(-20).map(l => ({ ts: l.slice(0, 23), line: l }));
+
+    // Recent audit events (last 20)
+    const recentAudit = auditLines.slice(-20).map(l => ({ ts: l.slice(0, 23), line: l }));
+
+    // Recent approvals
+    const recentApprovals = todayLines
+      .filter(l => l.includes('| APPROVAL') || l.includes('| BUSINESS') && l.includes('APPROVAL'))
+      .slice(-10)
+      .map(l => ({ ts: l.slice(0, 23), line: l }));
+
+    // HTTP stats
+    const httpLines = todayLines.filter(l => l.includes('| HTTP_RES'));
+    const httpCount = httpLines.length;
+    const http4xx = httpLines.filter(l => / 4\d\d/.test(l)).length;
+    const http5xx = httpLines.filter(l => / 5\d\d/.test(l)).length;
+
+    // SMTP events today
+    const smtpLines = todayLines.filter(l => l.includes('| SMTP'));
+    const smtpSent = smtpLines.filter(l => l.toLowerCase().includes('sent')).length;
+    const smtpFailed = smtpLines.filter(l => l.toLowerCase().includes('fail')).length;
+
+    return ok(res, {
+      summary: {
+        errors_today: errorsToday,
+        warnings_today: warnsToday,
+        http_requests_today: httpCount,
+        http_4xx_today: http4xx,
+        http_5xx_today: http5xx,
+        smtp_sent_today: smtpSent,
+        smtp_failed_today: smtpFailed,
+        slow_requests_today: slowRequests.length,
+        business_events_today: businessEvents.length,
+      },
+      recent_errors:    recentErrors,
+      recent_approvals: recentApprovals,
+      recent_audit:     recentAudit,
+      business_events:  businessEvents,
+      slow_requests:    slowRequests.slice(-10).map(l => ({ ts: l.slice(0, 23), line: l })),
+    });
+  } catch (error: any) {
+    return fail(res, 500, error.message);
   }
 });
 
@@ -3396,18 +3803,25 @@ router.get('/distributor-portal/requests', async (req: Request, res: Response) =
     const dist = await resolveDistributor(jwt.id, jwt.email);
     if (!dist) return ok(res, { not_linked: true, data: [], total: 0, limit, offset });
 
-    const where: string[] = ['distributor_id = $1'];
-    const vals: any[]     = [dist.id];
-    if (status) { where.push(`status = $${vals.length + 1}`); vals.push(status); }
+    // Match by distributor_id (linked record) OR distributor_email (for any requests
+    // submitted before the account was properly linked)
+    const emailVals: any[]  = [dist.id, jwt.email];
+    const emailWhere = `(distributor_id = $1 OR LOWER(distributor_email) = LOWER($2))`;
+    const extraWhere: string[] = [];
+    const extraVals: any[]  = [];
+    if (status) { extraWhere.push(`status = $${emailVals.length + extraVals.length + 1}`); extraVals.push(status); }
+
+    const fullWhere = [emailWhere, ...extraWhere].join(' AND ');
+    const allVals   = [...emailVals, ...extraVals];
 
     const countRes = await query(
-      `SELECT COUNT(*) AS total FROM distributor_sim_requests WHERE ${where.join(' AND ')}`,
-      vals,
+      `SELECT COUNT(*) AS total FROM distributor_sim_requests WHERE ${fullWhere}`,
+      allVals,
     );
     const rowsRes  = await query(
-      `SELECT * FROM distributor_sim_requests WHERE ${where.join(' AND ')}
+      `SELECT * FROM distributor_sim_requests WHERE ${fullWhere}
        ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`,
-      vals,
+      allVals,
     );
     return ok(res, { not_linked: false, data: rowsRes.rows, total: Number(countRes.rows[0]?.total || 0), limit, offset });
   } catch (e: any) { return fail(res, 500, e.message); }
@@ -3421,12 +3835,17 @@ router.post('/distributor-portal/requests', async (req: Request, res: Response) 
     const sim_type = String(req.body.sim_type || '').toUpperCase();
     const quantity = Number(req.body.quantity);
     const notes    = req.body.notes ? String(req.body.notes) : null;
+    const ticket_number = String(req.body.ticket_number || '').trim();
+    if (!ticket_number)                          return fail(res, 400, 'Ticket number is required');
     if (!['PHYSICAL','ESIM'].includes(sim_type)) return fail(res, 400, 'sim_type must be PHYSICAL or ESIM');
     if (!quantity || quantity <= 0)              return fail(res, 400, 'quantity must be a positive number');
+    await onboardingService.assertTicketNumberIsUnused(ticket_number);
 
-    // Allow explicit distributor_id from form if user chose one; else resolve from JWT
+    // DISTRIBUTOR role users always resolve their own record (ignore form-supplied distributor_id
+    // so that submitted requests always appear in their own history).
+    // Non-distributor roles (e.g. MVNO_ADMIN using the form) may supply an explicit distributor_id.
     let dist: any = null;
-    if (req.body.distributor_id) {
+    if (jwt.role !== 'DISTRIBUTOR' && req.body.distributor_id) {
       const r = await query(
         `SELECT d.*, m.name AS mvno_name FROM distributors d LEFT JOIN mvnos m ON m.id = d.mvno_id WHERE d.id = $1 AND d.is_active = true LIMIT 1`,
         [req.body.distributor_id],
@@ -3443,10 +3862,10 @@ router.post('/distributor-portal/requests', async (req: Request, res: Response) 
 
     const insertRes = await query(
       `INSERT INTO distributor_sim_requests
-         (reference_no, distributor_id, distributor_email, mvno_id, mvno_name, sim_type, quantity, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         (reference_no, distributor_id, distributor_email, mvno_id, mvno_name, sim_type, quantity, notes, ticket_number)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
-      [ref, dist.id, jwt.email, dist.mvno_id, dist.mvno_name, sim_type, quantity, notes],
+      [ref, dist.id, jwt.email, dist.mvno_id, dist.mvno_name, sim_type, quantity, notes, ticket_number],
     );
     return ok(res, insertRes.rows[0]);
   } catch (e: any) { return fail(res, 500, e.message); }
@@ -3470,462 +3889,917 @@ router.get('/distributor-portal/requests/:id', async (req: Request, res: Respons
   } catch (e: any) { return fail(res, 500, e.message); }
 });
 
-// ==================== MVNO ADMIN PORTAL ROUTES ====================
-// All routes: /api/mvno-admin/*
-// Auth: requires valid JWT with role MVNO_ADMIN (or SUPER_ADMIN for testing)
-// Scoping: all queries filtered by req.user.mvno_id === resource.mvno_id
+// ==================== COMPANY ONBOARDING (Phase 2) ====================
 
-/** Middleware helper: verify JWT is MVNO_ADMIN and return payload, else 401/403 */
+function requireAuth(req: Request): { id: string; email: string; role: string; full_name?: string } | null {
+  return (req as any).auth || null;
+}
+
+function requireAuthResponse(res: Response, auth: any, role?: string) {
+  if (!auth) return fail(res, 401, 'Authentication required');
+  if (role && auth.role !== role) return fail(res, 403, `${role} access required`);
+  return null;
+}
+
+const ENTITY_TYPES = [
+  'COMPANY', 'NGO', 'TRUST', 'COOPERATIVE', 'MDA_GOVERNMENT',
+  'POLITICAL_PARTY', 'FOREIGN_MISSION', 'REGIONAL_INTERNATIONAL_ORG',
+];
+
+const PARTNERSHIP_TYPES = ['SIM_DISTRIBUTOR', 'MOBILE_MONEY_DISTRIBUTOR', 'ORDINARY'];
+
+// Reference data
+router.get('/onboarding/entity-types', (_req: Request, res: Response) => ok(res, ENTITY_TYPES));
+router.get('/onboarding/partnership-types', (_req: Request, res: Response) => ok(res, PARTNERSHIP_TYPES));
+
+// Document checklist for a given entity type + partnership selection
+router.get('/onboarding/document-checklist', async (req: Request, res: Response) => {
+  try {
+    const entityType = String(req.query.entityType || '').toUpperCase() as any;
+    const partnershipTypes = String(req.query.partnershipTypes || '')
+      .split(',')
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean) as any;
+    if (!ENTITY_TYPES.includes(entityType)) return fail(res, 400, 'Valid entityType is required');
+    const checklist = await onboardingService.getDocumentChecklistForCompany(entityType, partnershipTypes);
+    return ok(res, checklist);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Search fee for a given entity type
+router.get('/onboarding/search-fee', async (req: Request, res: Response) => {
+  try {
+    const entityType = String(req.query.entityType || '').toUpperCase() as any;
+    if (!ENTITY_TYPES.includes(entityType)) return fail(res, 400, 'Valid entityType is required');
+    const fee = await onboardingService.getSearchFeeSetting(entityType);
+    return ok(res, fee);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Submit a new company onboarding request
+router.post('/onboarding/companies', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+
+    const input = req.body as onboardingService.CompanySubmissionInput;
+    if (!input.ticket_number || !String(input.ticket_number).trim()) {
+      return fail(res, 400, 'Ticket number is required');
+    }
+    if (!input.entity_type || !input.name || !input.physical_address || !input.company_email || !input.company_phone || !input.contact_name || !input.contact_phone || !input.contact_email || !input.contact_nin_passport) {
+      return fail(res, 400, 'Required company fields missing');
+    }
+    if (!input.partnership_types || !Array.isArray(input.partnership_types) || input.partnership_types.length === 0) {
+      return fail(res, 400, 'At least one partnership type is required');
+    }
+
+    const company = await onboardingService.submitCompany({
+      ...input,
+      created_by: auth.email,
+    });
+    return ok(res, company, 'Company onboarding request submitted');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// List company onboarding requests (Super Admin)
+router.get('/onboarding/companies', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const result = await onboardingService.getCompanies({
+      status: req.query.status as string,
+      entityType: req.query.entityType as string,
+      partnershipType: req.query.partnershipType as string,
+      search: req.query.search as string,
+      limit: parseInt(req.query.limit as string) || 50,
+      offset: parseInt(req.query.offset as string) || 0,
+    });
+    return ok(res, result);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Get company onboarding details (Super Admin)
+router.get('/onboarding/companies/:id', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const company = await onboardingService.getCompanyById(req.params.id as string);
+    if (!company) return fail(res, 404, 'Company not found');
+    return ok(res, company);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Update a company document tick/file (Super Admin)
+router.post('/onboarding/companies/:id/documents', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const { document_key, ticked, file_url, file_name, ticked_by } = req.body;
+    if (!document_key) return fail(res, 400, 'document_key required');
+
+    const updated = await onboardingService.updateCompanyDocument(
+      req.params.id as string,
+      document_key,
+      { ticked, file_url, file_name, ticked_by: ticked_by || auth.email },
+      auth.email
+    );
+    if (!updated) return fail(res, 404, 'Document not found');
+    return ok(res, updated, 'Document updated');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Approve a company approval seat (Super Admin)
+router.post('/onboarding/companies/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const { seat_order, approver_email } = req.body;
+    if (!seat_order || !approver_email) return fail(res, 400, 'seat_order and approver_email required');
+
+    const company = await onboardingService.approveCompanySeat(
+      req.params.id as string,
+      parseInt(seat_order),
+      approver_email,
+      auth.email
+    );
+    return ok(res, company, 'Approval seat approved');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Reject a company approval seat (Super Admin)
+router.post('/onboarding/companies/:id/reject', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const { seat_order, approver_email, reason } = req.body;
+    if (!seat_order || !approver_email || !reason) return fail(res, 400, 'seat_order, approver_email, and reason required');
+
+    const company = await onboardingService.rejectCompany(
+      req.params.id as string,
+      parseInt(seat_order),
+      approver_email,
+      reason,
+      auth.email
+    );
+    return ok(res, company, 'Company request rejected');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// -------------------- KYC SIM Agent onboarding (Phase 3) --------------------
+
+// KYC agent document checklist (public reference data)
+router.get('/onboarding/kyc-agents/checklist', async (_req: Request, res: Response) => {
+  try {
+    const checklist = await onboardingService.getKycAgentChecklist();
+    return ok(res, checklist);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Submit a new KYC SIM agent (any authenticated field user)
+router.post('/onboarding/kyc-agents', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+
+    const input = req.body as onboardingService.KycAgentSubmissionInput;
+    if (!input.ticket_number?.trim()) return fail(res, 400, 'ticket_number is required');
+    if (!input.distributor_id) return fail(res, 400, 'distributor_id is required');
+    if (!input.surname?.trim() || !input.given_names?.trim() || !input.phone?.trim()) {
+      return fail(res, 400, 'Surname, given names, and phone are required');
+    }
+    if (!input.district?.trim() || !input.county?.trim() || !input.subcounty?.trim() || !input.parish?.trim() || !input.village?.trim()) {
+      return fail(res, 400, 'District, county, subcounty, parish, and village are required');
+    }
+    if (input.reg_point_lat == null || input.reg_point_lng == null) return fail(res, 400, 'Registration point GPS coordinates are required');
+
+    const agent = await onboardingService.submitKycAgent({ ...input, created_by: auth.email });
+    return ok(res, agent, 'KYC agent submitted');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// List KYC agents (Super Admin)
+router.get('/onboarding/kyc-agents', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const result = await onboardingService.getKycAgents({
+      status: req.query.status as string,
+      distributorId: req.query.distributorId as string,
+      search: req.query.search as string,
+      limit: parseInt(req.query.limit as string) || 50,
+      offset: parseInt(req.query.offset as string) || 0,
+    });
+    return ok(res, result);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Get KYC agent detail (Super Admin)
+router.get('/onboarding/kyc-agents/:id', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const agent = await onboardingService.getKycAgentById(req.params.id as string);
+    if (!agent) return fail(res, 404, 'KYC agent not found');
+    return ok(res, agent);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Update a KYC agent document tick/file (Super Admin)
+router.post('/onboarding/kyc-agents/:id/documents', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const { document_key, ticked, file_url, file_name, ticked_by } = req.body;
+    if (!document_key) return fail(res, 400, 'document_key required');
+
+    const updated = await onboardingService.updateKycAgentDocument(
+      req.params.id as string,
+      document_key,
+      { ticked, file_url, file_name, ticked_by: ticked_by || auth.email },
+      auth.email
+    );
+    if (!updated) return fail(res, 404, 'Document not found');
+    return ok(res, updated, 'Document updated');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Approve a KYC agent (Super Admin)
+router.post('/onboarding/kyc-agents/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const agent = await onboardingService.approveKycAgent(req.params.id as string, auth.email);
+    return ok(res, agent, 'KYC agent approved');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Reject a KYC agent (Super Admin)
+router.post('/onboarding/kyc-agents/:id/reject', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const { reason } = req.body;
+    if (!reason) return fail(res, 400, 'reason required');
+
+    const agent = await onboardingService.rejectKycAgent(req.params.id as string, reason, auth.email);
+    return ok(res, agent, 'KYC agent rejected');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// -------------------- Mobile Money Agent onboarding (Phase 3B) --------------------
+// Distinct entity from KYC SIM agents above — tracked in its own mm_agents table.
+
+// Mobile Money agent document checklist (public reference data)
+router.get('/onboarding/mm-agents/checklist', async (_req: Request, res: Response) => {
+  try {
+    const checklist = await onboardingService.getMmAgentChecklist();
+    return ok(res, checklist);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Submit a new Mobile Money agent (any authenticated field user)
+router.post('/onboarding/mm-agents', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+
+    const input = req.body as onboardingService.MmAgentSubmissionInput;
+    if (!input.ticket_number?.trim()) return fail(res, 400, 'ticket_number is required');
+    if (!input.distributor_id) return fail(res, 400, 'distributor_id is required');
+    if (!input.outlet_name?.trim()) return fail(res, 400, 'Outlet name is required');
+    if (!input.first_name?.trim() || !input.last_name?.trim() || !input.phone?.trim()) {
+      return fail(res, 400, 'First name, last name, and phone are required');
+    }
+    if (!input.district?.trim() || !input.village?.trim()) return fail(res, 400, 'District and village are required');
+    if (input.reg_point_lat == null || input.reg_point_lng == null) return fail(res, 400, 'Registration point GPS coordinates are required');
+
+    const agent = await onboardingService.submitMmAgent({ ...input, created_by: auth.email });
+    return ok(res, agent, 'Mobile Money agent submitted');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// List Mobile Money agents (Super Admin)
+router.get('/onboarding/mm-agents', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const result = await onboardingService.getMmAgents({
+      status: req.query.status as string,
+      distributorId: req.query.distributorId as string,
+      search: req.query.search as string,
+      limit: parseInt(req.query.limit as string) || 50,
+      offset: parseInt(req.query.offset as string) || 0,
+    });
+    return ok(res, result);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Get Mobile Money agent detail (Super Admin)
+router.get('/onboarding/mm-agents/:id', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const agent = await onboardingService.getMmAgentById(req.params.id as string);
+    if (!agent) return fail(res, 404, 'Mobile Money agent not found');
+    return ok(res, agent);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Update a Mobile Money agent document tick/file (Super Admin)
+router.post('/onboarding/mm-agents/:id/documents', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const { document_key, ticked, file_url, file_name, ticked_by } = req.body;
+    if (!document_key) return fail(res, 400, 'document_key required');
+
+    const updated = await onboardingService.updateMmAgentDocument(
+      req.params.id as string,
+      document_key,
+      { ticked, file_url, file_name, ticked_by: ticked_by || auth.email },
+      auth.email
+    );
+    if (!updated) return fail(res, 404, 'Document not found');
+    return ok(res, updated, 'Document updated');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Approve a Mobile Money agent (Super Admin)
+router.post('/onboarding/mm-agents/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const agent = await onboardingService.approveMmAgent(req.params.id as string, auth.email);
+    return ok(res, agent, 'Mobile Money agent approved');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// Reject a Mobile Money agent (Super Admin)
+router.post('/onboarding/mm-agents/:id/reject', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const { reason } = req.body;
+    if (!reason) return fail(res, 400, 'reason required');
+
+    const agent = await onboardingService.rejectMmAgent(req.params.id as string, reason, auth.email);
+    return ok(res, agent, 'Mobile Money agent rejected');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// -------------------- Mobile Money Distributor onboarding (Phase 3C) --------------------
+
+router.get('/onboarding/mm-distributors', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const result = await onboardingService.getMmDistributors({
+      status: req.query.status as string,
+      search: req.query.search as string,
+      limit: parseInt(req.query.limit as string) || 50,
+      offset: parseInt(req.query.offset as string) || 0,
+    });
+    return ok(res, result);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.get('/onboarding/mm-distributors/:id', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const distributor = await onboardingService.getMmDistributorById(req.params.id as string);
+    if (!distributor) return fail(res, 404, 'Mobile Money distributor not found');
+    return ok(res, distributor);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.post('/onboarding/mm-distributors', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    const input = req.body as onboardingService.MmDistributorSubmissionInput;
+    if (!input.ticket_number?.trim()) return fail(res, 400, 'ticket_number is required');
+    const distributor = await onboardingService.submitMmDistributor({ ...input, created_by: auth.email });
+    return ok(res, distributor, 'Mobile Money distributor submitted');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.post('/onboarding/mm-distributors/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const distributor = await onboardingService.approveMmDistributor(req.params.id as string, auth.email);
+    return ok(res, distributor, 'Mobile Money distributor approved');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.post('/onboarding/mm-distributors/:id/reject', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const { reason } = req.body;
+    if (!reason) return fail(res, 400, 'reason required');
+    const distributor = await onboardingService.rejectMmDistributor(req.params.id as string, reason, auth.email);
+    return ok(res, distributor, 'Mobile Money distributor rejected');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// -------------------- Merchant onboarding (Phase 3D) --------------------
+
+router.get('/onboarding/merchants/checklist', async (_req: Request, res: Response) => {
+  try {
+    const checklist = await onboardingService.getMerchantChecklist();
+    return ok(res, checklist);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.get('/onboarding/merchants', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const result = await onboardingService.getMerchants({
+      status: req.query.status as string,
+      merchantType: req.query.merchantType as string,
+      search: req.query.search as string,
+      limit: parseInt(req.query.limit as string) || 50,
+      offset: parseInt(req.query.offset as string) || 0,
+    });
+    return ok(res, result);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.get('/onboarding/merchants/:id', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const merchant = await onboardingService.getMerchantById(req.params.id as string);
+    if (!merchant) return fail(res, 404, 'Merchant not found');
+    return ok(res, merchant);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.post('/onboarding/merchants', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    const input = req.body as onboardingService.MerchantSubmissionInput;
+    if (!input.ticket_number?.trim()) return fail(res, 400, 'ticket_number is required');
+    const merchant = await onboardingService.submitMerchant({ ...input, created_by: auth.email });
+    return ok(res, merchant, 'Merchant onboarding request submitted');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.post('/onboarding/merchants/:id/documents', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const { document_key, ticked, file_url, file_name, ticked_by } = req.body;
+    if (!document_key) return fail(res, 400, 'document_key required');
+    const updated = await onboardingService.updateMerchantDocument(
+      req.params.id as string,
+      document_key,
+      { ticked, file_url, file_name, ticked_by: ticked_by || auth.email },
+      auth.email
+    );
+    if (!updated) return fail(res, 404, 'Document not found');
+    return ok(res, updated, 'Document updated');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.post('/onboarding/merchants/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const merchant = await onboardingService.approveMerchant(req.params.id as string, auth.email);
+    return ok(res, merchant, 'Merchant approved');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.post('/onboarding/merchants/:id/reject', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+    const { reason } = req.body;
+    if (!reason) return fail(res, 400, 'reason required');
+    const merchant = await onboardingService.rejectMerchant(req.params.id as string, reason, auth.email);
+    return ok(res, merchant, 'Merchant rejected');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// -------------------- Authenticated document preview/download (Super Admin) --------------------
+// Serves onboarding documents (KYC/company/agent/merchant) through an authenticated
+// endpoint instead of the raw, unauthenticated `/uploads` static route, so the
+// in-portal DocumentViewer can enforce access control. Reuses the same 4 document
+// tables already used by the onboarding review endpoints above.
+
+const DOCUMENT_TABLE_BY_ENTITY: Record<string, string> = {
+  'company': 'company_documents',
+  'kyc-agent': 'kyc_agent_documents',
+  'mm-agent': 'mm_agent_documents',
+  'merchant': 'merchant_documents',
+};
+
+const DOCUMENT_MIME_BY_EXT: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+};
+
+/** Resolve a stored `/uploads/...` file_url to an absolute path, refusing to
+ *  serve anything outside the uploads directory (defense in depth against
+ *  path traversal, even though filenames are opaque content hashes). */
+function resolveUploadedFilePath(fileUrl: string): string | null {
+  if (!fileUrl.startsWith('/uploads/')) return null;
+  const uploadsRoot = path.join(process.cwd(), 'uploads');
+  const resolved = path.normalize(path.join(process.cwd(), fileUrl));
+  if (!resolved.startsWith(uploadsRoot)) return null;
+  return resolved;
+}
+
+function streamStoredFile(res: Response, absolutePath: string, fileName: string | null, download: boolean) {
+  if (!fs.existsSync(absolutePath)) return fail(res, 404, 'File not found on disk');
+  const stat = fs.statSync(absolutePath);
+  const ext = path.extname(fileName || absolutePath).toLowerCase();
+  const contentType = DOCUMENT_MIME_BY_EXT[ext] || 'application/octet-stream';
+  const safeName = (fileName || path.basename(absolutePath)).replace(/"/g, '');
+
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Length', String(stat.size));
+  res.setHeader('Content-Disposition', `${download ? 'attachment' : 'inline'}; filename="${safeName}"`);
+  res.setHeader('Cache-Control', 'private, no-cache');
+  fs.createReadStream(absolutePath).pipe(res);
+}
+
+router.get('/onboarding/documents/:entityType/:documentId/preview', async (req: Request, res: Response) => {
+  try {
+    const auth = requireAuth(req);
+    if (!auth) return fail(res, 401, 'Authentication required');
+    if (auth.role !== 'SUPER_ADMIN') return fail(res, 403, 'SUPER_ADMIN access required');
+
+    const table = DOCUMENT_TABLE_BY_ENTITY[req.params.entityType as string];
+    if (!table) return fail(res, 400, 'Invalid entity type');
+
+    const { rows } = await query<{ file_url: string | null; file_name: string | null }>(
+      `SELECT file_url, file_name FROM ${table} WHERE id = $1`,
+      [req.params.documentId]
+    );
+    const doc = rows[0];
+    if (!doc) return fail(res, 404, 'Document not found');
+    if (!doc.file_url) return fail(res, 404, 'No file uploaded for this document');
+
+    const absolutePath = resolveUploadedFilePath(doc.file_url);
+    if (!absolutePath) return fail(res, 410, 'Document is no longer available at its stored location');
+
+    streamStoredFile(res, absolutePath, doc.file_name, req.query.download === '1');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// ==================== MVNO SETTINGS & REPORTS (used by main app) ====================
+// These endpoints back the "MVNO Settings" and "Reports" tabs in the unified
+// Super Admin / MVNO Admin app (frontend/src/components/MvnoSettings.tsx and
+// MvnoReports.tsx). Kept after paxtel-admin removal because they are consumed
+// directly by the live frontend, not by the deleted standalone admin app.
+
+/** Middleware helper: verify JWT is MVNO_ADMIN/MANAGEMENT/SUPER_ADMIN and return payload, else 401/403 */
 function requireMvnoAdmin(req: Request, res: Response): Record<string, any> | null {
   const jwt = getJwtPayload(req);
   if (!jwt) { fail(res, 401, 'Authentication required'); return null; }
-  if (jwt.role !== 'MVNO_ADMIN' && jwt.role !== 'SUPER_ADMIN') {
+  if (jwt.role !== 'MVNO_ADMIN' && jwt.role !== 'SUPER_ADMIN' && jwt.role !== 'MANAGEMENT') {
     fail(res, 403, 'Access denied — MVNO Admin role required');
     return null;
   }
-  if (!jwt.mvno_id) { fail(res, 403, 'No MVNO associated with your account'); return null; }
   return jwt;
 }
 
-// ── GET /api/mvno-admin/dashboard/stats ──────────────────────────────────────
-router.get('/mvno-admin/dashboard/stats', async (req: Request, res: Response) => {
+function resolveMvnoId(jwt: Record<string,any>, query_mvno?: string): string {
+  if ((jwt.role === 'SUPER_ADMIN' || jwt.role === 'MANAGEMENT') && query_mvno) return String(query_mvno);
+  return jwt.mvno_id as string;
+}
+
+// ── GET /api/mvno-admin/settings ──────────────────────────────────────────────
+router.get('/mvno-admin/settings', async (req: Request, res: Response) => {
   try {
     const jwt = requireMvnoAdmin(req, res);
     if (!jwt) return;
-    const mvnoId = jwt.mvno_id as string;
+    const mvnoId = resolveMvnoId(jwt, req.query.mvno_id as string);
+    if (!mvnoId) return ok(res, { mvnoConfig: {}, notifConfig: {} });
 
-    // Total requests
-    const totalRes = await query(
-      `SELECT COUNT(*) AS total FROM stock_issuance_requests WHERE mvno_id = $1`, [mvnoId]);
-    const total_requests = parseInt(totalRes.rows[0].total, 10);
-
-    // Pending
-    const pendRes = await query(
-      `SELECT COUNT(*) AS cnt FROM stock_issuance_requests WHERE mvno_id = $1 AND status = 'PENDING'`, [mvnoId]);
-    const pending_requests = parseInt(pendRes.rows[0].cnt, 10);
-
-    // Approved today
-    const appTodayRes = await query(
-      `SELECT COUNT(*) AS cnt FROM stock_issuance_requests
-       WHERE mvno_id = $1 AND status IN ('APPROVED','COMPLETED')
-         AND updated_at::date = CURRENT_DATE`, [mvnoId]);
-    const approved_today = parseInt(appTodayRes.rows[0].cnt, 10);
-
-    // Rejected today
-    const rejTodayRes = await query(
-      `SELECT COUNT(*) AS cnt FROM stock_issuance_requests
-       WHERE mvno_id = $1 AND status = 'REJECTED' AND updated_at::date = CURRENT_DATE`, [mvnoId]);
-    const rejected_today = parseInt(rejTodayRes.rows[0].cnt, 10);
-
-    // Escalated
-    const escalRes = await query(
-      `SELECT COUNT(*) AS cnt FROM stock_issuance_requests
-       WHERE mvno_id = $1 AND status = 'ESCALATED'`, [mvnoId]);
-    const escalated_count = parseInt(escalRes.rows[0].cnt, 10);
-
-    // Physical stock for this MVNO
-    const physRes = await query(
-      `SELECT
-         COALESCE(SUM(b.total_sims), 0) AS total_received,
-         COALESCE(SUM(b.remaining_sims), 0) AS available,
-         COALESCE(SUM(b.total_sims - b.remaining_sims), 0) AS distributed
-       FROM boxes b
-       JOIN cartons c ON c.id = b.carton_id
-       WHERE c.mvno_id = $1`, [mvnoId]);
-    const total_physical_stock     = parseInt(physRes.rows[0].total_received, 10);
-    const available_physical_stock = parseInt(physRes.rows[0].available, 10);
-    const distributed_physical     = parseInt(physRes.rows[0].distributed, 10);
-
-    // eSIM stock for this MVNO
-    const esimRes = await query(
-      `SELECT
-         COUNT(*) AS total_received,
-         COUNT(*) FILTER (WHERE status = 'available') AS available,
-         COUNT(*) FILTER (WHERE status NOT IN ('available', 'reserved')) AS distributed
-       FROM esim_stock WHERE mvno_id = $1`, [mvnoId]);
-    const total_esim_stock     = parseInt(esimRes.rows[0].total_received, 10);
-    const available_esim_stock = parseInt(esimRes.rows[0].available, 10);
-    const distributed_esim     = parseInt(esimRes.rows[0].distributed, 10);
-
-    // Distribution trend — last 7 days
-    const trendRes = await query(
-      `SELECT
-         TO_CHAR(ph.issued_at::date, 'Mon DD') AS date,
-         COUNT(*) FILTER (WHERE UPPER(COALESCE(ph.sim_type, sir.sim_type, 'PHYSICAL')) = 'PHYSICAL') AS physical,
-         COUNT(*) FILTER (WHERE UPPER(COALESCE(ph.sim_type, sir.sim_type, 'PHYSICAL')) = 'ESIM')     AS esim
-       FROM pick_history ph
-       LEFT JOIN stock_issuance_requests sir ON ph.request_id = sir.id
-       WHERE ph.mvno_id = $1
-         AND ph.issued_at >= NOW() - INTERVAL '7 days'
-       GROUP BY ph.issued_at::date
-       ORDER BY ph.issued_at::date`, [mvnoId]);
-    const distribution_trend = trendRes.rows.map((r: any) => ({
-      date: r.date,
-      physical: parseInt(r.physical, 10),
-      esim: parseInt(r.esim, 10),
-    }));
-
-    // Requests overview by status
-    const ovRes = await query(
-      `SELECT status, COUNT(*) AS cnt
-       FROM stock_issuance_requests WHERE mvno_id = $1
-       GROUP BY status`, [mvnoId]);
-    const ovMap: Record<string, number> = {};
-    for (const row of ovRes.rows) ovMap[String(row.status).toLowerCase()] = parseInt(row.cnt, 10);
-    const requests_overview = {
-      pending:   ovMap['pending']   || 0,
-      approved:  (ovMap['approved'] || 0) + (ovMap['completed'] || 0),
-      rejected:  ovMap['rejected']  || 0,
-      escalated: ovMap['escalated'] || 0,
-      completed: ovMap['completed'] || 0,
-      total: total_requests,
-    };
-
-    // Recent 10 requests
-    const recentRes = await query(
-      `SELECT
-         sir.id, sir.id AS request_ref, sir.requester_id AS distributor_id,
-         COALESCE(d.name, 'Unknown') AS distributor_name,
-         sir.contact_person, sir.contact_email,
-         COALESCE(sir.sim_type, 'PHYSICAL') AS sim_type,
-         sir.quantity, sir.status, sir.notes, sir.created_at,
-         ROUND(EXTRACT(EPOCH FROM (NOW() - sir.created_at)) / 60)::int AS response_minutes
-       FROM stock_issuance_requests sir
-       LEFT JOIN distributors d ON d.id = sir.requester_id
-       WHERE sir.mvno_id = $1
-       ORDER BY sir.created_at DESC
-       LIMIT 10`, [mvnoId]);
-
-    return ok(res, {
-      total_requests, pending_requests, approved_today, rejected_today, escalated_count,
-      total_physical_stock, available_physical_stock, distributed_physical,
-      total_esim_stock, available_esim_stock, distributed_esim,
-      distribution_trend, requests_overview,
-      recent_requests: recentRes.rows,
-    });
+    const mvnoSet = await query(`SELECT * FROM mvno_settings WHERE mvno_id = $1`, [mvnoId]);
+    const row = mvnoSet.rows[0] || {};
+    return ok(res, { mvnoConfig: row, notifConfig: row });
   } catch (e: any) { return fail(res, 500, e.message); }
 });
 
-// ── GET /api/mvno-admin/physical-stock ────────────────────────────────────────
-router.get('/mvno-admin/physical-stock', async (req: Request, res: Response) => {
+// ── POST /api/mvno-admin/settings/mvno ────────────────────────────────────────
+router.post('/mvno-admin/settings/mvno', async (req: Request, res: Response) => {
   try {
     const jwt = requireMvnoAdmin(req, res);
     if (!jwt) return;
-    const mvnoId = jwt.mvno_id as string;
+    const targetMvnoId = resolveMvnoId(jwt, req.body.mvno_id);
+    if (!targetMvnoId) return fail(res, 400, 'MVNO ID required');
 
-    const physRes = await query(
-      `SELECT
-         COALESCE(SUM(b.total_sims), 0) AS total_received,
-         COALESCE(SUM(b.remaining_sims), 0) AS available,
-         COALESCE(SUM(b.total_sims - b.remaining_sims), 0) AS distributed
-       FROM boxes b
-       JOIN cartons c ON c.id = b.carton_id
-       WHERE c.mvno_id = $1`,
-      [mvnoId]
+    const {
+      lowStockThresholdPhysical, lowStockThresholdEsim, autoApproveThreshold,
+      escalationEnabled, escalationDelayHours,
+      workingHoursStart, workingHoursEnd, timezone,
+    } = req.body;
+
+    await query(
+      `INSERT INTO mvno_settings
+         (mvno_id, low_stock_threshold_physical, low_stock_threshold_esim,
+          auto_approve_threshold, escalation_enabled, escalation_delay_hours,
+          working_hours_start, working_hours_end, timezone, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+       ON CONFLICT (mvno_id) DO UPDATE SET
+         low_stock_threshold_physical = EXCLUDED.low_stock_threshold_physical,
+         low_stock_threshold_esim     = EXCLUDED.low_stock_threshold_esim,
+         auto_approve_threshold       = EXCLUDED.auto_approve_threshold,
+         escalation_enabled           = EXCLUDED.escalation_enabled,
+         escalation_delay_hours       = EXCLUDED.escalation_delay_hours,
+         working_hours_start          = EXCLUDED.working_hours_start,
+         working_hours_end            = EXCLUDED.working_hours_end,
+         timezone                     = EXCLUDED.timezone,
+         updated_at                   = NOW()`,
+      [targetMvnoId,
+       lowStockThresholdPhysical ?? 5000, lowStockThresholdEsim ?? 2000,
+       autoApproveThreshold ?? 100, escalationEnabled ?? true,
+       escalationDelayHours ?? 24, workingHoursStart ?? '09:00',
+       workingHoursEnd ?? '17:00', timezone ?? 'Africa/Kampala']
     );
 
-    return ok(res, {
-      mvno_id: mvnoId,
-      total: parseInt(physRes.rows[0].total_received, 10),
-      available: parseInt(physRes.rows[0].available, 10),
-      distributed: parseInt(physRes.rows[0].distributed, 10),
-    });
+    const io = getIo();
+    io?.to(`mvno:${targetMvnoId}`).emit('mvno_admin:settings_updated', { mvno_id: targetMvnoId });
+
+    return ok(res, { mvno_id: targetMvnoId }, 'MVNO settings saved');
   } catch (e: any) { return fail(res, 500, e.message); }
 });
 
-// ── GET /api/mvno-admin/esim-stock ────────────────────────────────────────────
-router.get('/mvno-admin/esim-stock', async (req: Request, res: Response) => {
+// ── POST /api/mvno-admin/settings/notifications ───────────────────────────────
+router.post('/mvno-admin/settings/notifications', async (req: Request, res: Response) => {
   try {
     const jwt = requireMvnoAdmin(req, res);
     if (!jwt) return;
-    const mvnoId = jwt.mvno_id as string;
+    const targetMvnoId = resolveMvnoId(jwt, req.body.mvno_id);
+    if (!targetMvnoId) return fail(res, 400, 'MVNO ID required');
 
-    const esimRes = await query(
-      `SELECT
-         COUNT(*) AS total_received,
-         COUNT(*) FILTER (WHERE status = 'available') AS available,
-         COUNT(*) FILTER (WHERE status NOT IN ('available', 'reserved')) AS distributed
-       FROM esim_stock WHERE mvno_id = $1`,
-      [mvnoId]
+    const {
+      emailNotifications, smsNotifications,
+      lowStockAlerts, requestAlerts, approvalAlerts, escalationAlerts,
+    } = req.body;
+
+    await query(
+      `INSERT INTO mvno_settings
+         (mvno_id, email_notifications, sms_notifications,
+          low_stock_alerts, request_alerts, approval_alerts, escalation_alerts, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT (mvno_id) DO UPDATE SET
+         email_notifications = EXCLUDED.email_notifications,
+         sms_notifications   = EXCLUDED.sms_notifications,
+         low_stock_alerts    = EXCLUDED.low_stock_alerts,
+         request_alerts      = EXCLUDED.request_alerts,
+         approval_alerts     = EXCLUDED.approval_alerts,
+         escalation_alerts   = EXCLUDED.escalation_alerts,
+         updated_at          = NOW()`,
+      [targetMvnoId,
+       emailNotifications ?? true, smsNotifications ?? false,
+       lowStockAlerts ?? true, requestAlerts ?? true,
+       approvalAlerts ?? true, escalationAlerts ?? true]
     );
 
-    return ok(res, {
-      mvno_id: mvnoId,
-      total: parseInt(esimRes.rows[0].total_received, 10),
-      available: parseInt(esimRes.rows[0].available, 10),
-      distributed: parseInt(esimRes.rows[0].distributed, 10),
+    const io = getIo();
+    io?.to(`mvno:${targetMvnoId}`).emit('mvno_admin:settings_updated', { mvno_id: targetMvnoId });
+
+    return ok(res, { mvno_id: targetMvnoId }, 'Notification settings saved');
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+/** Build report rows + summary for a given report type. Shared by generate/export. */
+async function buildMvnoReport(type: string, mvnoId: string, filters: { dateFrom?: string; dateTo?: string }): Promise<{ rows: any[]; summary: Record<string, any> }> {
+  const { dateFrom, dateTo } = filters;
+
+  if (type === 'stock-summary') {
+    const [physRes, esimRes] = await Promise.all([
+      query(`SELECT
+               COALESCE(SUM(total_sims),0)::int    AS total_received,
+               COALESCE(SUM(total_sims - COALESCE(issued_sims,0)),0)::int AS available,
+               COALESCE(SUM(COALESCE(issued_sims,0)),0)::int AS distributed
+             FROM boxes b JOIN cartons c ON c.id = b.carton_id WHERE c.mvno_id = $1`, [mvnoId]),
+      query(`SELECT
+               COUNT(*)::int AS total_received,
+               COUNT(*) FILTER (WHERE status='available')::int  AS available,
+               COUNT(*) FILTER (WHERE status='distributed')::int AS activated
+             FROM esim_stock WHERE mvno_id = $1`, [mvnoId]),
+    ]);
+    const rows = [
+      { metric: 'Physical — Total Received', value: physRes.rows[0]?.total_received ?? 0 },
+      { metric: 'Physical — Available',      value: physRes.rows[0]?.available ?? 0 },
+      { metric: 'Physical — Distributed',    value: physRes.rows[0]?.distributed ?? 0 },
+      { metric: 'eSIM — Total Received',     value: esimRes.rows[0]?.total_received ?? 0 },
+      { metric: 'eSIM — Available',          value: esimRes.rows[0]?.available ?? 0 },
+      { metric: 'eSIM — Activated',          value: esimRes.rows[0]?.activated ?? 0 },
+    ];
+    return { rows, summary: { ...physRes.rows[0], ...esimRes.rows[0] } };
+  }
+
+  if (type === 'distributor-performance') {
+    const conds: string[] = ['dsr.mvno_id = $1'];
+    const params: any[] = [mvnoId]; let pi = 2;
+    if (dateFrom) { conds.push(`dsr.created_at >= $${pi++}::date`); params.push(dateFrom); }
+    if (dateTo)   { conds.push(`dsr.created_at < ($${pi++}::date + INTERVAL '1 day')`); params.push(dateTo); }
+    const dataRes = await query(`
+      SELECT COALESCE(d.name,'Unknown') AS distributor_name,
+             COUNT(*)::int AS total_requests,
+             COUNT(*) FILTER (WHERE dsr.status IN ('APPROVED','COMPLETED'))::int AS approved,
+             COUNT(*) FILTER (WHERE dsr.status = 'REJECTED')::int AS rejected,
+             COALESCE(SUM(dsr.quantity) FILTER (WHERE dsr.status IN ('APPROVED','COMPLETED')),0)::int AS total_sims_received
+      FROM distributor_sim_requests dsr
+      LEFT JOIN distributors d ON d.id = dsr.distributor_id
+      WHERE ${conds.join(' AND ')}
+      GROUP BY d.name ORDER BY total_requests DESC`, params);
+    return { rows: dataRes.rows, summary: { distributors: dataRes.rows.length } };
+  }
+
+  if (type === 'monthly-trends') {
+    const dataRes = await query(`
+      SELECT TO_CHAR(date_trunc('month', dsr.created_at), 'YYYY-MM') AS month,
+             COUNT(*)::int AS requests_submitted,
+             COUNT(*) FILTER (WHERE dsr.status IN ('APPROVED','COMPLETED'))::int AS requests_approved,
+             COALESCE(SUM(dsr.quantity) FILTER (WHERE dsr.sim_type='PHYSICAL' AND dsr.status IN ('APPROVED','COMPLETED')),0)::int AS physical_distributed,
+             COALESCE(SUM(dsr.quantity) FILTER (WHERE dsr.sim_type='ESIM'     AND dsr.status IN ('APPROVED','COMPLETED')),0)::int AS esim_distributed
+      FROM distributor_sim_requests dsr
+      WHERE dsr.mvno_id = $1 AND dsr.created_at >= NOW() - INTERVAL '12 months'
+      GROUP BY 1 ORDER BY 1 DESC`, [mvnoId]);
+    return { rows: dataRes.rows, summary: { months: dataRes.rows.length } };
+  }
+
+  if (type === 'replenishment-history') {
+    const conds: string[] = ['dsr.mvno_id = $1'];
+    const params: any[] = [mvnoId]; let pi = 2;
+    if (dateFrom) { conds.push(`dsr.created_at >= $${pi++}::date`); params.push(dateFrom); }
+    if (dateTo)   { conds.push(`dsr.created_at < ($${pi++}::date + INTERVAL '1 day')`); params.push(dateTo); }
+    const dataRes = await query(`
+      SELECT dsr.reference_no, COALESCE(d.name,'Unknown') AS distributor_name,
+             dsr.sim_type, dsr.quantity, dsr.status, dsr.created_at
+      FROM distributor_sim_requests dsr
+      LEFT JOIN distributors d ON d.id = dsr.distributor_id
+      WHERE ${conds.join(' AND ')} ORDER BY dsr.created_at DESC`, params);
+    return { rows: dataRes.rows, summary: { total: dataRes.rows.length } };
+  }
+
+  if (type === 'escalation-report') {
+    const conds: string[] = [`dsr.mvno_id = $1`, `dsr.status = 'ESCALATED'`];
+    const params: any[] = [mvnoId]; let pi = 2;
+    if (dateFrom) { conds.push(`dsr.created_at >= $${pi++}::date`); params.push(dateFrom); }
+    if (dateTo)   { conds.push(`dsr.created_at < ($${pi++}::date + INTERVAL '1 day')`); params.push(dateTo); }
+    const dataRes = await query(`
+      SELECT dsr.reference_no, COALESCE(d.name,'Unknown') AS distributor,
+             dsr.created_at AS escalated_at, dsr.reviewed_at AS resolved_at, dsr.reviewed_by AS resolved_by
+      FROM distributor_sim_requests dsr
+      LEFT JOIN distributors d ON d.id = dsr.distributor_id
+      WHERE ${conds.join(' AND ')} ORDER BY dsr.created_at DESC`, params);
+    return { rows: dataRes.rows, summary: { escalations: dataRes.rows.length } };
+  }
+
+  return { rows: [], summary: {} };
+}
+
+// ── POST /api/mvno-admin/reports/generate ─────────────────────────────────────
+router.post('/mvno-admin/reports/generate', async (req: Request, res: Response) => {
+  try {
+    const jwt = requireMvnoAdmin(req, res);
+    if (!jwt) return;
+    const { type, filters, mvno_id } = req.body;
+    const mvnoId = resolveMvnoId(jwt, mvno_id);
+    if (!mvnoId) return fail(res, 400, 'MVNO ID required');
+    if (!type) return fail(res, 400, 'Report type required');
+
+    const data = await buildMvnoReport(String(type), mvnoId, filters || {});
+    return ok(res, data);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// ── GET /api/mvno-admin/reports/export ────────────────────────────────────────
+router.get('/mvno-admin/reports/export', async (req: Request, res: Response) => {
+  try {
+    const jwt = requireMvnoAdmin(req, res);
+    if (!jwt) return;
+    const type     = String(req.query.type || '');
+    const format   = String(req.query.format || 'csv').toLowerCase();
+    const mvnoId   = resolveMvnoId(jwt, req.query.mvno_id as string);
+    const dateFrom = req.query.dateFrom ? String(req.query.dateFrom) : undefined;
+    const dateTo   = req.query.dateTo   ? String(req.query.dateTo)   : undefined;
+    if (!mvnoId) return fail(res, 400, 'MVNO ID required');
+    if (!type)   return fail(res, 400, 'Report type required');
+
+    const { rows } = await buildMvnoReport(type, mvnoId, { dateFrom, dateTo });
+
+    if (format === 'excel') {
+      const ExcelJS = (await import('exceljs')).default;
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet(type);
+      if (rows.length) {
+        sheet.columns = Object.keys(rows[0]).map(k => ({ header: k.replace(/_/g, ' ').toUpperCase(), key: k }));
+        rows.forEach((r: any) => sheet.addRow(r));
+      }
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${type}.xlsx"`);
+      await workbook.xlsx.write(res);
+      return res.end();
+    }
+
+    const headers = rows.length ? Object.keys(rows[0]) : [];
+    const csv = [headers.join(',')]
+      .concat(rows.map((r: any) => headers.map(h => `"${String(r[h] ?? '').replace(/"/g, '""')}"`).join(',')))
+      .join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${type}.csv"`);
+    return res.send(csv);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+// ==================== STRAY STOCK ROUTES ====================
+
+router.get('/stray-stock', async (req: Request, res: Response) => {
+  try {
+    const data = await stockService.getStrayStock();
+    return ok(res, data);
+  } catch (e: any) { return fail(res, 500, e.message); }
+});
+
+router.post('/stray-stock', async (req: Request, res: Response) => {
+  try {
+    const { iccid, msisdn, mvno_id, reason, marked_by, marked_by_email, notes } = req.body || {};
+    const result = await stockService.markAsStray({
+      iccid: String(iccid || ''),
+      msisdn,
+      mvno_id,
+      reason,
+      marked_by: marked_by ? String(marked_by) : undefined,
+      marked_by_email: marked_by_email ? String(marked_by_email) : undefined,
+      notes: notes ? String(notes) : undefined,
     });
+    if (!result.success) return fail(res, 400, result.error || 'Failed to mark as stray');
+    return ok(res, { id: result.id }, 'Marked as stray');
   } catch (e: any) { return fail(res, 500, e.message); }
 });
 
-// ── GET /api/mvno-admin/sim-requests ─────────────────────────────────────────
-router.get('/mvno-admin/sim-requests', async (req: Request, res: Response) => {
+router.put('/stray-stock/:id/return', async (req: Request, res: Response) => {
   try {
-    const jwt = requireMvnoAdmin(req, res);
-    if (!jwt) return;
-    const mvnoId = jwt.mvno_id as string;
-
-    const status    = String(req.query.status    || '').trim().toUpperCase();
-    const sim_type  = String(req.query.sim_type  || '').trim().toUpperCase();
-    const search    = String(req.query.search    || '').trim();
-    const date_from = String(req.query.date_from || '').trim();
-    const date_to   = String(req.query.date_to   || '').trim();
-    const page      = Math.max(1, parseInt(String(req.query.page  || '1'), 10));
-    const limit     = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '25'), 10)));
-    const offset    = (page - 1) * limit;
-
-    const conditions: string[] = ['sir.mvno_id = $1'];
-    const params: any[] = [mvnoId];
-    let pi = 2;
-
-    if (status)    { conditions.push(`sir.status = $${pi++}`);   params.push(status); }
-    if (sim_type)  { conditions.push(`UPPER(COALESCE(sir.sim_type,'PHYSICAL')) = $${pi++}`); params.push(sim_type); }
-    if (search)    { conditions.push(`(COALESCE(d.name,'') ILIKE $${pi} OR sir.id::text ILIKE $${pi})`); params.push(`%${search}%`); pi++; }
-    if (date_from) { conditions.push(`sir.created_at >= $${pi++}::date`); params.push(date_from); }
-    if (date_to)   { conditions.push(`sir.created_at < ($${pi++}::date + INTERVAL '1 day')`); params.push(date_to); }
-
-    const where = conditions.join(' AND ');
-
-    const countRes = await query(
-      `SELECT COUNT(*) AS total
-       FROM stock_issuance_requests sir
-       LEFT JOIN distributors d ON d.id = sir.requester_id
-       WHERE ${where}`, params);
-    const total = parseInt(countRes.rows[0].total, 10);
-
-    const dataParams = [...params, limit, offset];
-    const dataRes = await query(
-      `SELECT
-         sir.id, sir.id AS request_ref, sir.requester_id AS distributor_id,
-         COALESCE(d.name, 'Unknown') AS distributor_name,
-         sir.contact_person, sir.contact_email,
-         COALESCE(sir.sim_type, 'PHYSICAL') AS sim_type,
-         sir.quantity, sir.status, sir.notes,
-         sir.rejection_reason, sir.escalation_reason,
-         sir.reviewed_by, sir.reviewed_at, sir.escalated_at,
-         sir.created_at, sir.mvno_id,
-         ROUND(EXTRACT(EPOCH FROM (NOW() - sir.created_at)) / 60)::int AS response_minutes
-       FROM stock_issuance_requests sir
-       LEFT JOIN distributors d ON d.id = sir.requester_id
-       WHERE ${where}
-       ORDER BY
-         CASE sir.status WHEN 'ESCALATED' THEN 0 WHEN 'PENDING' THEN 1 ELSE 2 END,
-         sir.created_at DESC
-       LIMIT $${pi++} OFFSET $${pi++}`, dataParams);
-
-    return ok(res, { rows: dataRes.rows, total, page, limit });
+    const result = await stockService.returnStrayToPool(String(req.params.id));
+    if (!result.success) return fail(res, 400, result.error || 'Failed to return to pool');
+    return ok(res, {}, 'Returned to pool');
   } catch (e: any) { return fail(res, 500, e.message); }
 });
 
-// ── GET /api/mvno-admin/sim-requests/:id ─────────────────────────────────────
-router.get('/mvno-admin/sim-requests/:id', async (req: Request, res: Response) => {
+router.put('/stray-stock/:id/write-off', async (req: Request, res: Response) => {
   try {
-    const jwt = requireMvnoAdmin(req, res);
-    if (!jwt) return;
-    const mvnoId = jwt.mvno_id as string;
-    const { id } = req.params;
-
-    const res2 = await query(
-      `SELECT sir.*, COALESCE(d.name,'Unknown') AS distributor_name,
-              d.contact_person AS dist_contact, d.email AS dist_email
-       FROM stock_issuance_requests sir
-       LEFT JOIN distributors d ON d.id = sir.requester_id
-       WHERE sir.id = $1 AND sir.mvno_id = $2`, [id, mvnoId]);
-
-    if (!res2.rows[0]) return fail(res, 404, 'Request not found or not in your MVNO');
-    return ok(res, res2.rows[0]);
-  } catch (e: any) { return fail(res, 500, e.message); }
-});
-
-// ── PATCH /api/mvno-admin/sim-requests/:id/approve ───────────────────────────
-router.patch('/mvno-admin/sim-requests/:id/approve', async (req: Request, res: Response) => {
-  try {
-    const jwt = requireMvnoAdmin(req, res);
-    if (!jwt) return;
-    const mvnoId = jwt.mvno_id as string;
-    const { id } = req.params;
-    const notes = req.body.notes ? String(req.body.notes) : null;
-
-    // Check request exists and belongs to this MVNO
-    const check = await query(
-      `SELECT * FROM stock_issuance_requests WHERE id = $1 AND mvno_id = $2`, [id, mvnoId]);
-    if (!check.rows[0]) return fail(res, 404, 'Request not found or not in your MVNO');
-    if (!['PENDING', 'ESCALATED'].includes(check.rows[0].status)) {
-      return fail(res, 400, `Cannot approve a request with status ${check.rows[0].status}`);
-    }
-
-    // Stock availability check (best-effort guard before approval)
-    const simType = String(check.rows[0].sim_type || 'PHYSICAL').toUpperCase();
-    const qty = Math.max(0, parseInt(String(check.rows[0].quantity || 0), 10));
-    if (qty <= 0) return fail(res, 400, 'Invalid request quantity');
-
-    if (simType === 'ESIM') {
-      const availRes = await query(
-        `SELECT COUNT(*) FILTER (WHERE status = 'available')::int AS available
-         FROM esim_stock WHERE mvno_id = $1`,
-        [mvnoId]
-      );
-      const available = Number(availRes.rows[0]?.available ?? 0);
-      if (available < qty) {
-        return fail(res, 409, `Insufficient eSIM stock. Available: ${available}, requested: ${qty}`);
-      }
-    } else {
-      const physRes = await query(
-        `SELECT COALESCE(SUM(b.remaining_sims), 0)::int AS available
-         FROM boxes b
-         JOIN cartons c ON c.id = b.carton_id
-         WHERE c.mvno_id = $1`,
-        [mvnoId]
-      );
-      const available = Number(physRes.rows[0]?.available ?? 0);
-      if (available < qty) {
-        return fail(res, 409, `Insufficient physical SIM stock. Available: ${available}, requested: ${qty}`);
-      }
-    }
-
-    // Auto-assign stock for issuance, then issue immediately.
-    const requestRow = check.rows[0];
-    const distributorId = requestRow.requester_id as string | null;
-    if (!distributorId) return fail(res, 400, 'Request has no distributor requester_id');
-
-    if (simType === 'ESIM') {
-      const iccidRes = await query(
-        `SELECT iccid
-         FROM esim_stock
-         WHERE mvno_id = $1 AND status = 'available'
-         ORDER BY iccid
-         LIMIT $2`,
-        [mvnoId, qty]
-      );
-      const iccids = iccidRes.rows.map((r: any) => String(r.iccid)).filter(Boolean);
-      if (iccids.length < qty) {
-        return fail(res, 409, `Insufficient eSIM stock. Available: ${iccids.length}, requested: ${qty}`);
-      }
-
-      await query(
-        `UPDATE stock_issuance_requests
-         SET status = 'READY_FOR_APPROVAL',
-             reviewed_by = $1,
-             reviewed_at = NOW(),
-             notes = COALESCE($2, notes),
-             assigned_esim_iccids = $3,
-             assigned_box_quantities = '[]'::jsonb,
-             updated_at = NOW()
-         WHERE id = $4`,
-        [jwt.email, notes, iccids, id]
-      );
-    } else {
-      // Allocate from boxes belonging to this MVNO.
-      const boxesRes = await query(
-        `SELECT b.id::text AS box_id, COALESCE(b.remaining_sims, 0)::int AS remaining
-         FROM boxes b
-         JOIN cartons c ON c.id = b.carton_id
-         WHERE c.mvno_id = $1 AND COALESCE(b.remaining_sims, 0) > 0
-         ORDER BY COALESCE(b.remaining_sims, 0) DESC, b.created_at ASC`,
-        [mvnoId]
-      );
-
-      let remainingQty = qty;
-      const assigned: Array<{ box_id: string; quantity: number }> = [];
-      for (const row of boxesRes.rows) {
-        if (remainingQty <= 0) break;
-        const boxRemaining = Math.max(0, Number(row.remaining || 0));
-        if (boxRemaining <= 0) continue;
-        const take = Math.min(boxRemaining, remainingQty);
-        assigned.push({ box_id: String(row.box_id), quantity: take });
-        remainingQty -= take;
-      }
-      if (remainingQty > 0) {
-        return fail(res, 409, `Insufficient physical SIM stock. Available: ${qty - remainingQty}, requested: ${qty}`);
-      }
-
-      await query(
-        `UPDATE stock_issuance_requests
-         SET status = 'READY_FOR_APPROVAL',
-             reviewed_by = $1,
-             reviewed_at = NOW(),
-             notes = COALESCE($2, notes),
-             assigned_box_quantities = $3::jsonb,
-             assigned_esim_iccids = NULL,
-             updated_at = NOW()
-         WHERE id = $4`,
-        [jwt.email, notes, JSON.stringify(assigned), id]
-      );
-    }
-
-    const issued = await stockService.issueApprovedStockRequest(id);
-
-    // Audit log
-    await query(
-      `INSERT INTO stock_audit_logs (request_id, action, performed_by, performed_by_email, details)
-       VALUES ($1, 'REQUEST_APPROVED', $2, $3, $4)`,
-      [id, jwt.id, jwt.email, JSON.stringify({ notes, approved_at: new Date().toISOString(), issued_status: issued.request?.status || null })]).catch(() => {});
-
-    const io = getIo();
-    io?.to('mvno:paxtel').emit('mvno_admin:request_updated', { id, status: 'APPROVED' });
-
-    return ok(res, { id, status: issued.request?.status || 'COMPLETED', pdf_url: issued.pdf_url ?? null }, 'Request approved and issued successfully');
-  } catch (e: any) { return fail(res, 500, e.message); }
-});
-
-// ── PATCH /api/mvno-admin/sim-requests/:id/reject ────────────────────────────
-router.patch('/mvno-admin/sim-requests/:id/reject', async (req: Request, res: Response) => {
-  try {
-    const jwt = requireMvnoAdmin(req, res);
-    if (!jwt) return;
-    const mvnoId = jwt.mvno_id as string;
-    const { id } = req.params;
-    const reason = String(req.body.reason || '').trim();
-    if (!reason) return fail(res, 400, 'Rejection reason is required');
-
-    const check = await query(
-      `SELECT * FROM stock_issuance_requests WHERE id = $1 AND mvno_id = $2`, [id, mvnoId]);
-    if (!check.rows[0]) return fail(res, 404, 'Request not found or not in your MVNO');
-    if (!['PENDING', 'ESCALATED'].includes(check.rows[0].status)) {
-      return fail(res, 400, `Cannot reject a request with status ${check.rows[0].status}`);
-    }
-
-    await query(
-      `UPDATE stock_issuance_requests
-       SET status = 'REJECTED', rejection_reason = $1,
-           reviewed_by = $2, reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = $3`,
-      [reason, jwt.email, id]);
-
-    await query(
-      `INSERT INTO stock_audit_logs (request_id, action, performed_by, performed_by_email, details)
-       VALUES ($1, 'REQUEST_REJECTED', $2, $3, $4)`,
-      [id, jwt.id, jwt.email, JSON.stringify({ reason, rejected_at: new Date().toISOString() })]).catch(() => {});
-
-    const io = getIo();
-    io?.to('mvno:paxtel').emit('mvno_admin:request_updated', { id, status: 'REJECTED' });
-    return ok(res, { id, status: 'REJECTED' }, 'Request rejected');
-  } catch (e: any) { return fail(res, 500, e.message); }
-});
-
-// ── PATCH /api/mvno-admin/sim-requests/:id/escalate ──────────────────────────
-router.patch('/mvno-admin/sim-requests/:id/escalate', async (req: Request, res: Response) => {
-  try {
-    const jwt = requireMvnoAdmin(req, res);
-    if (!jwt) return;
-    const mvnoId = jwt.mvno_id as string;
-    const { id } = req.params;
-    const reason = String(req.body.reason || 'Manually escalated by MVNO Admin').trim();
-
-    const check = await query(
-      `SELECT * FROM stock_issuance_requests WHERE id = $1 AND mvno_id = $2`, [id, mvnoId]);
-    if (!check.rows[0]) return fail(res, 404, 'Request not found or not in your MVNO');
-
-    await query(
-      `UPDATE stock_issuance_requests
-       SET status = 'ESCALATED', escalation_reason = $1,
-           escalated_at = NOW(), updated_at = NOW()
-       WHERE id = $2`,
-      [reason, id]);
-
-    const io = getIo();
-    io?.to('mvno:paxtel').emit('mvno_admin:request_updated', { id, status: 'ESCALATED' });
-    return ok(res, { id, status: 'ESCALATED' }, 'Request escalated');
+    const result = await stockService.writeOffStray(String(req.params.id));
+    if (!result.success) return fail(res, 400, result.error || 'Failed to write off');
+    return ok(res, {}, 'Written off');
   } catch (e: any) { return fail(res, 500, e.message); }
 });
 

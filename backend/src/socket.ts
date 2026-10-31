@@ -1,7 +1,18 @@
 import type http from 'http';
+import { createRequire } from 'module';
 import { config } from './config/index.js';
 import { logLine } from './logging/unified-logger.js';
 import { verifyJwt } from './routes/api.js';
+
+// Use createRequire to handle socket.io import in ES modules
+const require = createRequire(import.meta.url);
+let Server: any = null;
+try {
+  const socketIO = require('socket.io');
+  Server = socketIO.Server;
+} catch (e) {
+  // Will handle in initSocket
+}
 
 type SocketIOServer = any;
 let io: SocketIOServer | null = null;
@@ -9,19 +20,10 @@ let io: SocketIOServer | null = null;
 export function initSocket(server: http.Server): SocketIOServer | null {
   if (io) return io;
 
-  // Lazy-load socket.io so the backend can still boot even
-  // when npm install is blocked in some environments.
-  let SocketIO: any;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    SocketIO = require('socket.io');
-  } catch {
+  if (!Server) {
     logLine('WRN', 'SOCKET', 'socket.io not installed; realtime updates disabled');
-    io = null;
     return null;
   }
-
-  const { Server } = SocketIO;
 
   io = new Server(server, {
     cors: {
